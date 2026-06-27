@@ -123,12 +123,24 @@ if uploaded_file:
 
     custom_prompt = ""
     if prompt_mode == "Custom prompt":
-        custom_prompt = st.text_area(
-            "Custom prompt template",
-            value="Create an Excel-ready table from the PDF text below.\n\nPDF text:\n{pdf_text}",
-            height=180,
-            help="Use {pdf_text} where you want the extracted PDF text to be inserted.",
-        )
+        with st.form("custom_prompt_form"):
+            custom_prompt = st.text_area(
+                "Custom prompt template",
+                value=st.session_state.get("custom_prompt_value", "Create an Excel-ready table from the PDF text below.\n\nPDF text:\n{pdf_text}"),
+                height=180,
+                key="custom_prompt_input",
+                help="Use {pdf_text} where you want the extracted PDF text to be inserted.",
+            )
+            submitted = st.form_submit_button("Use custom prompt")
+
+        if submitted:
+            st.session_state["custom_prompt_value"] = custom_prompt
+            st.success("Custom prompt applied.")
+        else:
+            custom_prompt = st.session_state.get("custom_prompt_value", "")
+
+        if not st.session_state.get("custom_prompt_value"):
+            st.caption("Press the button above to apply your custom prompt template.")
     elif prompt_mode == "No prompt":
         st.info("The generated output will just contain the extracted PDF text.")
 
