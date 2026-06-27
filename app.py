@@ -25,6 +25,8 @@ PDF text:
 {pdf_text}
 """
 
+PROMPT_MODE_OPTIONS = ["Default prompt", "No prompt", "Custom prompt"]
+
 
 def extract_pdf_text(file_bytes: bytes) -> tuple[str, int]:
     page_texts = []
@@ -38,8 +40,20 @@ def extract_pdf_text(file_bytes: bytes) -> tuple[str, int]:
     return "\n\n".join(page_texts).strip(), len(page_texts)
 
 
-def build_ai_excel_prompt(pdf_text: str) -> str:
-    return AI_EXCEL_PROMPT_TEMPLATE.format(pdf_text=pdf_text.strip())
+def build_ai_excel_prompt(pdf_text: str, prompt_mode: str = "Default prompt", custom_prompt: str | None = None) -> str:
+    cleaned_pdf_text = pdf_text.strip()
+
+    if prompt_mode == "No prompt":
+        return cleaned_pdf_text
+
+    if prompt_mode == "Custom prompt":
+        if custom_prompt and "{pdf_text}" in custom_prompt:
+            return custom_prompt.replace("{pdf_text}", cleaned_pdf_text)
+        if custom_prompt:
+            return f"{custom_prompt.strip()}\n\n{cleaned_pdf_text}"
+        return cleaned_pdf_text
+
+    return AI_EXCEL_PROMPT_TEMPLATE.format(pdf_text=cleaned_pdf_text)
 
 
 def render_copy_button(text: str) -> None:
@@ -99,7 +113,26 @@ if uploaded_file:
         st.warning("No extractable text found in this PDF.")
         st.stop()
 
-    prompt = build_ai_excel_prompt(extracted_text)
+    prompt_mode = st.radio(
+        "Prompt option",
+        options=PROMPT_MODE_OPTIONS,
+        index=0,
+        horizontal=True,
+        help="Choose whether to use the default prompt, skip the prompt entirely, or add your own custom prompt template.",
+    )
+
+    custom_prompt = ""
+    if prompt_mode == "Custom prompt":
+        custom_prompt = st.text_area(
+            "Custom prompt template",
+            value="Create an Excel-ready table from the PDF text below.\n\nPDF text:\n{pdf_text}",
+            height=180,
+            help="Use {pdf_text} where you want the extracted PDF text to be inserted.",
+        )
+    elif prompt_mode == "No prompt":
+        st.info("The generated output will just contain the extracted PDF text.")
+
+    prompt = build_ai_excel_prompt(extracted_text, prompt_mode=prompt_mode, custom_prompt=custom_prompt)
 
     col_a, col_b, col_c = st.columns(3)
     col_a.metric("Pages", page_count)
@@ -108,15 +141,23 @@ if uploaded_file:
 
     render_copy_button(prompt)
 
+    download_label = "Download prompt as .txt" if prompt_mode != "No prompt" else "Download generated content as .txt"
+    download_file_name = (
+        f"{uploaded_file.name.rsplit('.', 1)[0]}_ai_excel_prompt.txt"
+        if prompt_mode != "No prompt"
+        else f"{uploaded_file.name.rsplit('.', 1)[0]}_extracted_text.txt"
+    )
+
     st.download_button(
-        "Download prompt as .txt",
+        download_label,
         data=prompt,
-        file_name=f"{uploaded_file.name.rsplit('.', 1)[0]}_ai_excel_prompt.txt",
+        file_name=download_file_name,
         mime="text/plain",
         use_container_width=True,
     )
 
-    st.text_area("ChatGPT-ready prompt", value=prompt, height=420)
+    prompt_label = "ChatGPT-ready prompt" if prompt_mode != "No prompt" else "Generated content"
+    st.text_area(prompt_label, value=prompt, height=420)
 
     with st.expander("View extracted PDF text"):
         st.text_area("Extracted text", value=extracted_text, height=300)
