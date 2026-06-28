@@ -99,8 +99,7 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# ─── Extraction logic (ported from main.py, deterministic only) ───────────────
-
+# ─── AI Extraction Prompt ─────────────────────────────────────────────────────
 AI_EXCEL_PROMPT_TEMPLATE = """You are an expert bank statement data extraction assistant.
 
 Create a clean Excel-ready output from the PDF text below.
@@ -136,19 +135,17 @@ DISCLAIMER_MARKERS = [
     'disclaimer',
 ]
 
-
+# ─── Core Helper Functions ────────────────────────────────────────────────────
 def is_disclaimer_text(text: str) -> bool:
     if not text:
         return False
     normalized = re.sub(r'\s+', ' ', text).strip().lower()
     return any(m in normalized for m in DISCLAIMER_MARKERS)
 
-
 def starts_new_transaction_row(line_words: list[dict]) -> bool:
     if not line_words:
         return False
     return bool(DATE_RE.match(line_words[0].get('text', '').strip()))
-
 
 def words_to_lines(page, y_tolerance: int = 6) -> list[list[dict]]:
     words = page.extract_words(x_tolerance=4, y_tolerance=4)
@@ -172,7 +169,6 @@ def words_to_lines(page, y_tolerance: int = 6) -> list[list[dict]]:
     if current_line:
         lines.append(sorted(current_line, key=lambda x: x['x0']))
     return lines
-
 
 def parse_transaction_line(line_words: list[dict]) -> dict | None:
     if not line_words:
@@ -212,8 +208,8 @@ def parse_transaction_line(line_words: list[dict]) -> dict | None:
     return {"date": date, "particulars": particulars,
             "withdrawal": withdrawal, "deposit": deposit, "balance": balance}
 
-
-def extract_account_info(first_page_text: str) -> dict:
+# ─── Bank Specific Parsers ────────────────────────────────────────────────────
+def extract_uco_account_info(first_page_text: str) -> dict:
     info = {}
     patterns = {
         "Statement Period": r'Between\s+(\d{2}-\d{2}-\d{4}\s+and\s+\d{2}-\d{2}-\d{4})',
@@ -232,14 +228,12 @@ def extract_account_info(first_page_text: str) -> dict:
         m = re.search(pattern, first_page_text, re.IGNORECASE)
         info[field] = m.group(1).strip() if m else ""
 
-    # Name: ALL-CAPS lines immediately before the standalone "Name" label
     name_m = re.search(r'((?:[A-Z][A-Z\s&\./]+\n)+)Name\n', first_page_text)
     if name_m:
         lines = [l.strip() for l in name_m.group(1).strip().split('\n') if l.strip()]
         lines = [l for l in lines if l != info.get("Branch Name", "")]
         info["Account Name"] = " / ".join(lines)
 
-    # Address: lines after the SECOND "Address\n" occurrence up to IFSC/MICR/A/c
     addr_blocks = list(re.finditer(r'Address\n', first_page_text))
     if len(addr_blocks) >= 2:
         start = addr_blocks[-1].end()
@@ -256,8 +250,7 @@ def extract_account_info(first_page_text: str) -> dict:
 
     return info
 
-
-def extract_transactions(file_bytes: bytes) -> list[dict]:
+def extract_uco_transactions(file_bytes: bytes) -> list[dict]:
     transactions = []
     with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
         for page in pdf.pages:
@@ -282,7 +275,29 @@ def extract_transactions(file_bytes: bytes) -> list[dict]:
                                 transactions[-1]['particulars'] = extra
     return transactions
 
+# ─── Router Logic ─────────────────────────────────────────────────────────────
+def parse_bank_statement(bank_name: str, file_bytes: bytes, page1_text: str):
+    """Routes the PDF to the correct parsing logic based on the selected bank."""
+    
+    if bank_name == "UCO Bank":
+        account_info = extract_uco_account_info(page1_text)
+        transactions = extract_uco_transactions(file_bytes)
+        return account_info, transactions
+        
+    elif bank_name == "SBI (Coming Soon)":
+        st.warning("SBI parsing logic is not yet implemented. Please check back later!")
+        st.stop()
+        
+    elif bank_name == "HDFC (Coming Soon)":
+        st.warning("HDFC parsing logic is not yet implemented. Please check back later!")
+        st.stop()
+        
+    else:
+        st.error("Unsupported bank selected.")
+        st.stop()
 
+
+# ─── Standard Utilities ───────────────────────────────────────────────────────
 def extract_pdf_text(file_bytes: bytes) -> tuple[str, int]:
     page_texts = []
     with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
@@ -292,8 +307,7 @@ def extract_pdf_text(file_bytes: bytes) -> tuple[str, int]:
             page_texts.append(f"--- Page {i} of {total} ---\n{text.strip()}")
     return "\n\n".join(page_texts).strip(), len(page_texts)
 
-
-def build_excel_workbook(account_info: dict, transactions: list[dict]) -> openpyxl.Workbook:
+def build_excel_workbook(account_info: dict, transactions: list[dict], bank_name: str) -> openpyxl.Workbook:
     wb = openpyxl.Workbook()
     ws_info = wb.active
     ws_info.title = "Account Details"
@@ -305,7 +319,7 @@ def build_excel_workbook(account_info: dict, transactions: list[dict]) -> openpy
 
     ws_info.merge_cells("A1:B1")
     c = ws_info["A1"]
-    c.value = "UCO Bank — Account Statement Details"
+    c.value = f"{bank_name} — Account Statement Details"
     c.font  = title_font
     c.alignment = Alignment(horizontal="left", vertical="center")
     ws_info.row_dimensions[1].height = 30
@@ -358,14 +372,12 @@ def build_excel_workbook(account_info: dict, transactions: list[dict]) -> openpy
     ws_tx.freeze_panes = "A2"
     return wb
 
-
 # ─── Streamlit UI ─────────────────────────────────────────────────────────────
-
 st.markdown("""
 <div class="app-header">
   <div>
     <h1>🏦 Bank Statement → Excel</h1>
-    <p>Deterministic extraction · Works offline · UCO Bank / multi-bank</p>
+    <p>Deterministic extraction · Works offline · Multi-bank support</p>
   </div>
 </div>
 """, unsafe_allow_html=True)
@@ -386,11 +398,21 @@ st.caption(
 
 st.divider()
 
+# ── Bank Selector ─────────────────────────────────────────────────────────────
+st.markdown("#### Select your Bank")
+selected_bank = st.selectbox(
+    label="bank",
+    options=["UCO Bank", "SBI (Coming Soon)", "HDFC (Coming Soon)"],
+    label_visibility="collapsed",
+)
+
+st.divider()
+
 # ── Upload ────────────────────────────────────────────────────────────────────
 uploaded_file = st.file_uploader(
-    "Upload your bank statement PDF",
+    f"Upload your {selected_bank} statement PDF",
     type=["pdf"],
-    help="Supports text-based PDFs (UCO Bank, SBI, PNB, HDFC, ICICI etc.)"
+    help="Supports text-based PDFs. Ensure the selected bank matches the uploaded document."
 )
 
 if not uploaded_file:
@@ -402,18 +424,22 @@ submit = st.button("🚀 Process PDF", type="primary", use_container_width=False
 if not submit:
     st.stop()
 
+# BUG FIX: Read file bytes only ONCE
 file_bytes = uploaded_file.read()
+
 # ══════════════════════════════════════════════════════════════════════════════
 # MODE A — Parse & Download Excel
 # ══════════════════════════════════════════════════════════════════════════════
 if mode == "📊 Parse & Download Excel":
 
-    with st.spinner("Extracting data…"):
+    with st.spinner(f"Extracting data using {selected_bank} logic…"):
         try:
             with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
                 page1_text = pdf.pages[0].extract_text() or "" if pdf.pages else ""
-            account_info  = extract_account_info(page1_text)
-            transactions  = extract_transactions(file_bytes)
+            
+            # ROUTER CALLED HERE
+            account_info, transactions = parse_bank_statement(selected_bank, file_bytes, page1_text)
+            
             pdf_text, page_count = extract_pdf_text(file_bytes)
         except Exception as e:
             st.error(f"Failed to read PDF: {e}")
@@ -457,7 +483,7 @@ if mode == "📊 Parse & Download Excel":
     """, unsafe_allow_html=True)
 
     # ── Download button ────────────────────────────────────────────────────────
-    wb = build_excel_workbook(account_info, transactions)
+    wb = build_excel_workbook(account_info, transactions, selected_bank)
     excel_buffer = io.BytesIO()
     wb.save(excel_buffer)
     excel_buffer.seek(0)
