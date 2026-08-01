@@ -1,3 +1,12 @@
 streamlit>=1.36
 pdfplumber>=0.11
 openpyxl>=3.1
+pdf2image>=1.17
+pytesseract>=0.3
+pymupdf
+
+
+# Canara OCR also needs system binaries:
+# - Poppler: add the bin folder containing pdfinfo.exe and pdftoppm.exe to PATH,
+#   or set POPPLER_PATH to that bin folder.
+# - Tesseract OCR: install separately and ensure tesseract is on PATH.

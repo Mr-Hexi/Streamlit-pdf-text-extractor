@@ -1,12 +1,24 @@
 import io
+import os
 import re
+import shutil
 from typing import Any, Dict, List
 
 import openpyxl
 import pdfplumber
+import pytesseract
 import streamlit as st
+from pdf2image import convert_from_bytes
+from pdf2image.exceptions import PDFInfoNotInstalledError, PDFPageCountError
+from pdfminer.pdfdocument import PDFPasswordIncorrect
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
+from PIL import Image
+
+try:
+    import fitz
+except ImportError:
+    fitz = None
 
 # ─── Page config ──────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -136,6 +148,106 @@ DISCLAIMER_MARKERS = [
 ]
 
 # ─── Core Helper Functions ────────────────────────────────────────────────────
+class PdfPasswordError(Exception):
+    pass
+
+
+class CanaraOcrSetupError(Exception):
+    pass
+
+
+def normalize_pdf_password(password: str | None) -> str | None:
+    if password is None:
+        return None
+    password = password.strip()
+    return password or None
+
+
+def safe_float(val: str) -> float:
+    try:
+        return float(val.replace(",", ""))
+    except (ValueError, AttributeError):
+        return 0.0
+
+
+def open_pdf(file_bytes: bytes, password: str | None = None):
+    password = normalize_pdf_password(password)
+    try:
+        return pdfplumber.open(io.BytesIO(file_bytes), password=password)
+    except PDFPasswordIncorrect as exc:
+        if password:
+            message = "The PDF password is incorrect. Please check it and try again."
+        else:
+            message = "This PDF is password protected. Enter the PDF password and try again."
+        raise PdfPasswordError(message) from exc
+
+
+def find_poppler_path() -> str | None:
+    if shutil.which("pdfinfo") and shutil.which("pdftoppm"):
+        return None
+
+    env_path = os.environ.get("POPPLER_PATH")
+    candidates = [
+        env_path,
+        os.path.join(os.getcwd(), "poppler", "bin"),
+        os.path.join(os.getcwd(), "poppler", "Library", "bin"),
+        r"C:\poppler\bin",
+        r"C:\poppler\Library\bin",
+        r"C:\Program Files\poppler\bin",
+        r"C:\Program Files\poppler\Library\bin",
+    ]
+    for path in candidates:
+        if not path:
+            continue
+        if os.path.exists(os.path.join(path, "pdfinfo.exe")) and os.path.exists(os.path.join(path, "pdftoppm.exe")):
+            return path
+
+    return None
+
+
+def get_poppler_help_message() -> str:
+    return (
+        "Canara Bank extraction needs a PDF rendering backend. Install PyMuPDF with "
+        "`pip install PyMuPDF`, or install Poppler and add its bin folder to PATH/set POPPLER_PATH. "
+        "For Poppler, the folder must contain pdfinfo.exe and pdftoppm.exe."
+    )
+
+
+def find_tesseract_path() -> str | None:
+    if shutil.which("tesseract"):
+        return None
+    candidates = [
+        r"C:\Program Files\Tesseract-OCR\tesseract.exe",
+        r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
+        os.path.join(os.environ.get("LOCALAPPDATA", ""), r"Programs\Tesseract-OCR\tesseract.exe"),
+        os.path.join(os.environ.get("LOCALAPPDATA", ""), r"Tesseract-OCR\tesseract.exe"),
+        os.path.join(os.environ.get("USERPROFILE", ""), r"AppData\Local\Programs\Tesseract-OCR\tesseract.exe"),
+        os.path.join(os.environ.get("USERPROFILE", ""), r"AppData\Local\Tesseract-OCR\tesseract.exe"),
+    ]
+    for path in candidates:
+        if path and os.path.exists(path):
+            return path
+    return None
+
+
+# Configure tesseract path on startup if detected in default folders
+_tesseract_path = find_tesseract_path()
+if _tesseract_path:
+    pytesseract.pytesseract.tesseract_cmd = _tesseract_path
+
+
+def get_tesseract_help_message() -> str:
+    return (
+        "Canara Bank extraction requires Tesseract OCR to read text from image-based PDFs.\n\n"
+        "**Please install Tesseract OCR to resolve this:**\n\n"
+        "1. Download the Windows installer from the UB Mannheim community build repository:\n"
+        "   https://github.com/UB-Mannheim/tesseract/wiki\n"
+        "2. Run the installer (e.g., `tesseract-ocr-w64-setup-v5.x.x.exe`) and complete the installation "
+        "using the default location (`C:\\Program Files\\Tesseract-OCR`).\n"
+        "3. Once installed, restart this Streamlit application. The app will automatically detect Tesseract at the default installation path, or you can add it to your system PATH."
+    )
+
+
 def is_disclaimer_text(text: str) -> bool:
     if not text:
         return False
@@ -250,9 +362,9 @@ def extract_uco_account_info(first_page_text: str) -> dict:
 
     return info
 
-def extract_uco_transactions(file_bytes: bytes) -> list[dict]:
+def extract_uco_transactions(file_bytes: bytes, password: str | None = None) -> list[dict]:
     transactions = []
-    with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
+    with open_pdf(file_bytes, password) as pdf:
         for page in pdf.pages:
             lines = words_to_lines(page)
             for line_words in lines:
@@ -276,12 +388,230 @@ def extract_uco_transactions(file_bytes: bytes) -> list[dict]:
     return transactions
 
 # ─── Router Logic ─────────────────────────────────────────────────────────────
-def parse_bank_statement(bank_name: str, file_bytes: bytes, page1_text: str):
+# Canara Bank Parser
+_CB_X_DATE_MAX        = 340
+_CB_X_PARTICULARS_MAX = 880
+_CB_X_DEPOSITS_MAX    = 1140
+_CB_X_WITHDRAWALS_MAX = 1440
+
+_CB_DATE_RE   = re.compile(r'^\d{2}[-/.\s]\d{2}[-/.\s]\d{2,4}$')
+_CB_NUMBER_RE = re.compile(r'^\d[\d,]*(?:\.\d{1,2})?$')
+_CB_CHQ_RE    = re.compile(r'^chq[;:.]?$', re.IGNORECASE)
+_CB_NOISE_RE  = re.compile(
+    r'^(date|particulars|deposits?|withdrawals?|balance|opening|closing|'
+    r'constituent|ombudsman|phish|unauthori|canara|branch|account|'
+    r'rbi|atm|pin|intents|deemed|correct|requested|always|login|'
+    r'click|note|please|beware|attempt|holder|along)$',
+    re.IGNORECASE
+)
+
+
+def _cb_pdf_images(file_bytes: bytes, password: str | None = None, **kwargs):
+    password = normalize_pdf_password(password)
+    pymupdf_images = _cb_pdf_images_with_pymupdf(file_bytes, password, **kwargs)
+    if pymupdf_images is not None:
+        return pymupdf_images
+
+    poppler_path = find_poppler_path()
+    try:
+        return convert_from_bytes(
+            file_bytes,
+            dpi=200,
+            userpw=password,
+            poppler_path=poppler_path,
+            **kwargs,
+        )
+    except PDFInfoNotInstalledError as exc:
+        raise CanaraOcrSetupError(get_poppler_help_message()) from exc
+    except PDFPageCountError as exc:
+        message = str(exc)
+        if "Unable to get page count" in message:
+            raise CanaraOcrSetupError(get_poppler_help_message()) from exc
+        raise
+
+
+def _cb_pdf_images_with_pymupdf(file_bytes: bytes, password: str | None = None, **kwargs) -> list[Image.Image] | None:
+    if fitz is None:
+        return None
+
+    first_page = kwargs.get("first_page")
+    last_page = kwargs.get("last_page")
+    dpi = kwargs.get("dpi", 200)
+    scale = dpi / 72
+    matrix = fitz.Matrix(scale, scale)
+
+    try:
+        doc = fitz.open(stream=file_bytes, filetype="pdf")
+        if doc.needs_pass:
+            if not password or not doc.authenticate(password):
+                raise PdfPasswordError("The PDF password is incorrect. Please check it and try again.")
+
+        start = max((first_page or 1) - 1, 0)
+        end = min(last_page or doc.page_count, doc.page_count)
+        images = []
+
+        for page_index in range(start, end):
+            page = doc.load_page(page_index)
+            pix = page.get_pixmap(matrix=matrix, alpha=False)
+            img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+            images.append(img)
+
+        doc.close()
+        return images
+    except PdfPasswordError:
+        raise
+    except Exception:
+        return None
+
+
+def _cb_confidence_ok(confidence: str) -> bool:
+    try:
+        return float(confidence) > 20
+    except ValueError:
+        return False
+
+
+def _cb_normalize_date(text: str) -> str:
+    normalized = text.strip().replace("O", "0").replace("o", "0")
+    normalized = re.sub(r'[-/.\s]+', '-', normalized)
+    if not _CB_DATE_RE.match(text.strip()) and not re.match(r'^\d{2}-\d{2}-\d{2,4}$', normalized):
+        return ""
+    day, month, year = normalized.split("-")
+    if len(year) == 2:
+        year = "20" + year
+    return f"{day}-{month}-{year}"
+
+
+def _cb_normalize_amount(text: str) -> str:
+    normalized = re.sub(r'[^\d,.]', '', text.strip())
+    normalized = normalized.strip(',.')
+    if not _CB_NUMBER_RE.match(normalized):
+        return ""
+    return normalized
+
+
+def _cb_parse_page(img) -> list[dict]:
+    data = pytesseract.image_to_data(img, output_type=pytesseract.Output.DICT)
+    words = [
+        {'text': t.strip(), 'x': data['left'][i], 'y': data['top'][i]}
+        for i, t in enumerate(data['text'])
+        if t.strip() and _cb_confidence_ok(data['conf'][i])
+    ]
+    if not words:
+        return []
+
+    dates = []
+    for w in words:
+        date = _cb_normalize_date(w['text'])
+        if date and w['x'] < _CB_X_DATE_MAX:
+            dates.append((w['y'], date))
+    if not dates:
+        return []
+
+    chq_ys = sorted(set(w['y'] for w in words if _CB_CHQ_RE.match(w['text'])))
+    img_height = img.size[1]
+    transactions = []
+
+    for idx, (date_y, date_str) in enumerate(dates):
+        own_chq_y = next((y for y in chq_ys if y >= date_y), img_height)
+        if idx == 0:
+            header_ys = [w['y'] for w in words if w['text'].lower() == 'particulars']
+            part_start_y = (header_ys[0] + 20) if header_ys else 0
+        else:
+            prev_chq_ys = [y for y in chq_ys if y >= dates[idx - 1][0]]
+            part_start_y = (prev_chq_ys[0] + 30) if prev_chq_ys else dates[idx - 1][0]
+
+        next_date_y = dates[idx + 1][0] if idx + 1 < len(dates) else img_height
+        particulars_parts, deposits, withdrawals, balances = [], [], [], []
+
+        for w in words:
+            x, y, t = w['x'], w['y'], w['text']
+            if x < _CB_X_DATE_MAX:
+                continue
+            elif x < _CB_X_PARTICULARS_MAX:
+                if part_start_y <= y < own_chq_y and not _CB_NOISE_RE.match(t) and len(t) > 1:
+                    particulars_parts.append((y, x, t))
+            elif date_y <= y < next_date_y:
+                amount = _cb_normalize_amount(t)
+                if x < _CB_X_DEPOSITS_MAX:
+                    if amount:
+                        deposits.append(amount)
+                elif x < _CB_X_WITHDRAWALS_MAX:
+                    if amount:
+                        withdrawals.append(amount)
+                else:
+                    if amount:
+                        balances.append(amount)
+
+        if not balances:
+            continue
+
+        particulars_parts.sort(key=lambda w: (w[0], w[1]))
+        transactions.append({
+            'date':        date_str,
+            'particulars': " ".join(t for _, _, t in particulars_parts),
+            'deposit':     deposits[-1]    if deposits    else "",
+            'withdrawal':  withdrawals[-1] if withdrawals else "",
+            'balance':     balances[-1],
+        })
+
+    return transactions
+
+
+def extract_canara_account_info(ocr_text: str) -> dict:
+    info = {}
+    patterns = {
+        "Statement Period": r'between\s+(\d{2}-\w{3}-\d{4}\s+and\s+\d{2}-\w{3}-\d{4})',
+        "Account Number":   r'A/c\s+(X+\d+)',
+        "Customer ID":      r'Customer Id\s+(\S+)',
+        "Account Name":     r'Name\s+([A-Z][A-Z\s]+?)(?:\n\nPhone|\nPhone)',
+        "Phone":            r'Phone\s+(\+?\d+)',
+        "Branch Code":      r'Branch Code\s*\nBranch Name\s*\nIFSC Code\s*\n\nAddress\s*\nRoad\s*\n\n(\d+)',
+        "Branch Name":      r'Branch Code\s*\nBranch Name\s*\nIFSC Code\s*\n\nAddress\s*\nRoad\s*\n\n\d+\s*\n\n([A-Z]+)',
+        "IFSC Code":        r'(CNRB\w+|[A-Z]{4}0\w+)',
+    }
+    for field, pattern in patterns.items():
+        m = re.search(pattern, ocr_text, re.IGNORECASE)
+        info[field] = m.group(1).strip() if m else ""
+
+    addr_m = re.search(r'Address\s+(.*?)(?=\n\nBranch Code)', ocr_text, re.DOTALL)
+    if addr_m:
+        lines = [l.strip() for l in addr_m.group(1).split('\n') if l.strip()]
+        info["Address"] = ", ".join(lines)
+
+    return info
+
+
+def extract_canara_transactions(file_bytes: bytes, password: str | None = None) -> list[dict]:
+    images = _cb_pdf_images(file_bytes, password)
+    try:
+        return [tx for img in images for tx in _cb_parse_page(img)]
+    except (pytesseract.TesseractNotFoundError, pytesseract.TesseractError) as exc:
+        raise CanaraOcrSetupError(get_tesseract_help_message()) from exc
+
+
+def extract_canara_info_from_bytes(file_bytes: bytes, password: str | None = None) -> dict:
+    images = _cb_pdf_images(file_bytes, password, first_page=1, last_page=1)
+    if not images:
+        raise CanaraOcrSetupError("Could not render the first page of the PDF.")
+    try:
+        ocr_text = pytesseract.image_to_string(images[0])
+    except (pytesseract.TesseractNotFoundError, pytesseract.TesseractError) as exc:
+        raise CanaraOcrSetupError(get_tesseract_help_message()) from exc
+    return extract_canara_account_info(ocr_text)
+
+
+def parse_bank_statement(bank_name: str, file_bytes: bytes, page1_text: str, password: str | None = None):
     """Routes the PDF to the correct parsing logic based on the selected bank."""
     
     if bank_name == "UCO Bank":
         account_info = extract_uco_account_info(page1_text)
-        transactions = extract_uco_transactions(file_bytes)
+        transactions = extract_uco_transactions(file_bytes, password)
+        return account_info, transactions
+
+    elif bank_name == "Canara Bank":
+        account_info = extract_canara_info_from_bytes(file_bytes, password)
+        transactions = extract_canara_transactions(file_bytes, password)
         return account_info, transactions
         
     elif bank_name == "SBI (Coming Soon)":
@@ -298,9 +628,14 @@ def parse_bank_statement(bank_name: str, file_bytes: bytes, page1_text: str):
 
 
 # ─── Standard Utilities ───────────────────────────────────────────────────────
-def extract_pdf_text(file_bytes: bytes) -> tuple[str, int]:
+def extract_first_page_text(file_bytes: bytes, password: str | None = None) -> str:
+    with open_pdf(file_bytes, password) as pdf:
+        return pdf.pages[0].extract_text() or "" if pdf.pages else ""
+
+
+def extract_pdf_text(file_bytes: bytes, password: str | None = None) -> tuple[str, int]:
     page_texts = []
-    with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
+    with open_pdf(file_bytes, password) as pdf:
         total = len(pdf.pages)
         for i, page in enumerate(pdf.pages, 1):
             text = page.extract_text() or ""
@@ -402,7 +737,7 @@ st.divider()
 st.markdown("#### Select your Bank")
 selected_bank = st.selectbox(
     label="bank",
-    options=["UCO Bank", "SBI (Coming Soon)", "HDFC (Coming Soon)"],
+    options=["UCO Bank", "Canara Bank", "SBI (Coming Soon)", "HDFC (Coming Soon)"],
     label_visibility="collapsed",
 )
 
@@ -413,6 +748,12 @@ uploaded_file = st.file_uploader(
     f"Upload your {selected_bank} statement PDF",
     type=["pdf"],
     help="Supports text-based PDFs. Ensure the selected bank matches the uploaded document."
+)
+
+pdf_password = st.text_input(
+    "PDF password (optional)",
+    type="password",
+    help="Required only when the uploaded PDF is password protected.",
 )
 
 if not uploaded_file:
@@ -434,28 +775,37 @@ if mode == "📊 Parse & Download Excel":
 
     with st.spinner(f"Extracting data using {selected_bank} logic…"):
         try:
-            with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
-                page1_text = pdf.pages[0].extract_text() or "" if pdf.pages else ""
+            page1_text = extract_first_page_text(file_bytes, pdf_password)
             
             # ROUTER CALLED HERE
-            account_info, transactions = parse_bank_statement(selected_bank, file_bytes, page1_text)
+            account_info, transactions = parse_bank_statement(selected_bank, file_bytes, page1_text, pdf_password)
             
-            pdf_text, page_count = extract_pdf_text(file_bytes)
+            with open_pdf(file_bytes, pdf_password) as _pdf:
+                page_count = len(_pdf.pages)
+        except PdfPasswordError as e:
+            st.error(str(e))
+            st.stop()
+        except CanaraOcrSetupError as e:
+            st.error(str(e))
+            st.stop()
         except Exception as e:
             st.error(f"Failed to read PDF: {e}")
             st.stop()
 
     if not transactions:
-        st.error("No transactions found. Make sure the PDF contains selectable text (not a scanned image).")
+        if selected_bank == "Canara Bank":
+            st.error(
+                "No Canara transactions found. OCR ran, but the app could not detect the transaction rows. "
+                "Check that the uploaded PDF is a Canara ePassbook/statement with the expected table layout, "
+                "and that the scan is clear enough for OCR."
+            )
+        else:
+            st.error("No transactions found. Make sure the PDF contains selectable text (not a scanned image).")
         st.stop()
 
     # ── Stats row ─────────────────────────────────────────────────────────────
-    total_withdrawals = sum(
-        float(tx["withdrawal"].replace(",", "")) for tx in transactions if tx.get("withdrawal")
-    )
-    total_deposits = sum(
-        float(tx["deposit"].replace(",", "")) for tx in transactions if tx.get("deposit")
-    )
+    total_withdrawals = sum(safe_float(tx["withdrawal"]) for tx in transactions if tx.get("withdrawal"))
+    total_deposits = sum(safe_float(tx["deposit"]) for tx in transactions if tx.get("deposit"))
 
     st.markdown(f"""
     <div class="stat-row">
@@ -554,7 +904,10 @@ if mode == "📊 Parse & Download Excel":
 else:
     with st.spinner("Extracting text from PDF…"):
         try:
-            pdf_text, page_count = extract_pdf_text(file_bytes)
+            pdf_text, page_count = extract_pdf_text(file_bytes, pdf_password)
+        except PdfPasswordError as e:
+            st.error(str(e))
+            st.stop()
         except Exception as e:
             st.error(f"Failed to read PDF: {e}")
             st.stop()
@@ -594,7 +947,7 @@ else:
     )
 
     # ── Download buttons ───────────────────────────────────────────────────────
-    col1, col2, col3 = st.columns(3)
+    col1, col2, _spacer = st.columns([1, 1, 2])
 
     with col1:
         st.download_button(
