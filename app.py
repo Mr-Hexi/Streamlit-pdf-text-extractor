@@ -1355,7 +1355,9 @@ def main():
     st.markdown("#### Select your Bank")
     selected_bank = st.selectbox(
         label="bank",
-        options=["UCO Bank", "Canara Bank", "Central Bank of India", "SBI (Coming Soon)", "HDFC (Coming Soon)"],
+        # options=["UCO Bank", "Canara Bank", "Central Bank of India", "SBI (Coming Soon)", "HDFC (Coming Soon)"],
+        options=["UCO Bank", "Canara Bank", "Central Bank of India"],
+
         label_visibility="collapsed",
     )
 
