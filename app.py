@@ -132,7 +132,7 @@ PDF text:
 {pdf_text}
 """
 
-DATE_RE   = re.compile(r'^(\d{2}-(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)-\d{4})', re.IGNORECASE)
+DATE_RE   = re.compile(r'^(\d{2}[-/.]\d{2}[-/.]\d{2,4}|\d{2}[-/.](?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\w*[-/.]\d{2,4})', re.IGNORECASE)
 NUMBER_RE = re.compile(r'^[\d,]+(?:\.\d+)?$')
 
 DISCLAIMER_MARKERS = [
@@ -152,8 +152,11 @@ class PdfPasswordError(Exception):
     pass
 
 
-class CanaraOcrSetupError(Exception):
+class OcrSetupError(Exception):
     pass
+
+
+CanaraOcrSetupError = OcrSetupError
 
 
 def normalize_pdf_password(password: str | None) -> str | None:
@@ -259,10 +262,11 @@ def starts_new_transaction_row(line_words: list[dict]) -> bool:
         return False
     return bool(DATE_RE.match(line_words[0].get('text', '').strip()))
 
-def words_to_lines(page, y_tolerance: int = 6) -> list[list[dict]]:
-    words = page.extract_words(x_tolerance=4, y_tolerance=4)
+def group_words_to_lines(words: list[dict], y_tolerance: int = 6) -> list[list[dict]]:
     if not words:
         return []
+    # Create copies to avoid altering caller data
+    words = [w.copy() for w in words]
     words.sort(key=lambda w: (w['top'] + w['bottom']) / 2)
     lines, current_line, current_y = [], [], None
     for w in words:
@@ -282,109 +286,299 @@ def words_to_lines(page, y_tolerance: int = 6) -> list[list[dict]]:
         lines.append(sorted(current_line, key=lambda x: x['x0']))
     return lines
 
-def parse_transaction_line(line_words: list[dict]) -> dict | None:
+
+def words_to_lines(page, y_tolerance: int = 6) -> list[list[dict]]:
+    words = page.extract_words(x_tolerance=4, y_tolerance=4)
+    return group_words_to_lines(words, y_tolerance)
+
+def parse_uco_transaction_line(line_words: list[dict]) -> dict | None:
     if not line_words:
         return None
-    first_word = line_words[0]['text']
+    
+    # Filter out vertical bars or empty words
+    words = []
+    for w in line_words:
+        t = w['text'].replace('|', '').strip()
+        if t:
+            w_copy = w.copy()
+            w_copy['text'] = t
+            words.append(w_copy)
+            
+    if not words:
+        return None
+        
+    first_word = words[0]['text']
     if not DATE_RE.match(first_word):
         return None
 
     date = first_word
-    particulars_words, numbers = [], []
+    particulars_parts = []
+    withdrawal = ""
+    deposit = ""
+    balance = ""
 
-    for w in line_words[1:]:
-        is_numeric = NUMBER_RE.match(w['text'].replace(',', ''))
-        if w['x1'] > 360 and is_numeric:
-            numbers.append((w['x1'], w['text']))
+    # Sort other words into columns based on their x0/x1 coordinates
+    for w in words[1:]:
+        text = w['text']
+        x0, x1 = w['x0'], w['x1']
+        
+        # Clean the text if it's numeric-like
+        clean_val = re.sub(r'[^\d,.]', '', text)
+        clean_val = clean_val.strip(',.')
+        is_numeric = bool(NUMBER_RE.match(clean_val))
+        
+        if is_numeric and x1 >= 380:
+            if x1 >= 520:
+                balance = clean_val
+            elif 460 <= x1 < 520:
+                deposit = clean_val
+            elif 380 <= x1 < 460:
+                withdrawal = clean_val
         else:
-            particulars_words.append(w['text'])
+            if x0 < 380:
+                particulars_parts.append(text)
 
-    particulars = " ".join(particulars_words).strip()
-    withdrawal, deposit, balance = "", "", ""
+    particulars = " ".join(particulars_parts).strip()
+    
+    if not balance:
+        return None
 
-    if len(numbers) >= 1:
-        balance = numbers[-1][1]
-    if len(numbers) >= 2:
-        x1, val = numbers[-2]
-        if x1 < 440:
-            withdrawal = val
-        else:
-            deposit = val
-    if len(numbers) >= 3:
-        x1, val = numbers[-3]
-        if x1 < 440:
-            withdrawal = val
-        else:
-            deposit = val
-
-    return {"date": date, "particulars": particulars,
-            "withdrawal": withdrawal, "deposit": deposit, "balance": balance}
+    return {
+        "date": date,
+        "particulars": particulars,
+        "withdrawal": withdrawal,
+        "deposit": deposit,
+        "balance": balance
+    }
 
 # ─── Bank Specific Parsers ────────────────────────────────────────────────────
+def extract_uco_info_from_bytes(file_bytes: bytes, password: str | None = None) -> str:
+    images = _cb_pdf_images(file_bytes, password, first_page=1, last_page=1)
+    if not images:
+        raise OcrSetupError("Could not render the first page of the PDF.")
+    try:
+        return pytesseract.image_to_string(images[0])
+    except (pytesseract.TesseractNotFoundError, pytesseract.TesseractError) as exc:
+        raise OcrSetupError(get_tesseract_help_message()) from exc
+
+
+def _uco_get_page_dimensions(file_bytes: bytes, page_index: int, password: str | None = None) -> tuple[float, float]:
+    if fitz:
+        try:
+            doc = fitz.open(stream=file_bytes, filetype="pdf")
+            if doc.needs_pass and password:
+                doc.authenticate(password)
+            page = doc.load_page(page_index)
+            w, h = page.rect.width, page.rect.height
+            doc.close()
+            return w, h
+        except Exception:
+            pass
+    return 595.0, 842.0
+
+
+def extract_uco_words_ocr(img: Image.Image, page_width: float, page_height: float) -> list[dict]:
+    img_width, img_height = img.size
+    scale_x = page_width / img_width
+    scale_y = page_height / img_height
+
+    data = pytesseract.image_to_data(img, output_type=pytesseract.Output.DICT)
+    words = []
+    for i, t in enumerate(data['text']):
+        txt = t.strip()
+        if txt and _cb_confidence_ok(data['conf'][i]):
+            x0 = data['left'][i] * scale_x
+            x1 = (data['left'][i] + data['width'][i]) * scale_x
+            top = data['top'][i] * scale_y
+            bottom = (data['top'][i] + data['height'][i]) * scale_y
+            words.append({
+                'text': txt,
+                'x0': x0,
+                'x1': x1,
+                'top': top,
+                'bottom': bottom
+            })
+    return words
+
+
 def extract_uco_account_info(first_page_text: str) -> dict:
     info = {}
+    normalized_text = first_page_text.replace('\r\n', '\n')
+    
     patterns = {
-        "Statement Period": r'Between\s+(\d{2}-\d{2}-\d{4}\s+and\s+\d{2}-\d{2}-\d{4})',
-        "Account Number":   r'account number\s+(\d+)',
-        "Customer ID":      r'Customer ID\s+([A-Z0-9]+)',
-        "CKYC ID":          r'CKYC ID\s+(\d+)',
-        "Account Type":     r'A/c Type\s+(\w+)',
-        "Mobile No":        r'Mobile No[.\s]+(\d+)',
-        "Email (Customer)": r'E-Mail ID\s+([A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,})',
-        "Branch Code":      r'Branch Code\s+(\d+)',
-        "Branch Name":      r'Branch Name\s+([A-Z]+)',
-        "IFSC Code":        r'IFSC Code\s+([A-Z0-9]+)',
-        "MICR Code":        r'MICR Code\s+(\d+)',
+        "Statement Period": r'(?:Between|from)\s+(\d{2}[-/.]\d{2}[-/.]\d{2,4}\s+(?:and|to)\s+\d{2}[-/.]\d{2}[-/.]\d{2,4})',
+        "Account Number":   r'(?:Account|A/c)\s+No\.?\s*(\d+)|account\s+number\s+(\d+)',
+        "Customer ID":      r'Customer\s+ID\s+([A-Z0-9]+)',
+        "CKYC ID":          r'CKYC\s+ID\s+(\d+)',
+        "Account Type":     r'A/c\s+Type\s+(\w+)',
+        "Mobile No":        r'Mobile\s+No[.\s]+(\d+)',
+        "Email (Customer)": r'E-Mail\s+ID\s+([A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,})',
+        "Branch Code":      r'Branch\s+Code\s+(\d+)',
+        "Branch Name":      r'Branch\s+Name\s+([A-Z]+)',
+        "IFSC Code":        r'IFSC\s+Code\s+([A-Z0-9]+)',
+        "MICR Code":        r'MICR\s+Code\s+(\d+)',
     }
     for field, pattern in patterns.items():
-        m = re.search(pattern, first_page_text, re.IGNORECASE)
-        info[field] = m.group(1).strip() if m else ""
+        m = re.search(pattern, normalized_text, re.IGNORECASE)
+        if m:
+            val = next((g for g in m.groups() if g is not None), "")
+            info[field] = val.strip()
+        else:
+            info[field] = ""
 
-    name_m = re.search(r'((?:[A-Z][A-Z\s&\./]+\n)+)Name\n', first_page_text)
-    if name_m:
-        lines = [l.strip() for l in name_m.group(1).strip().split('\n') if l.strip()]
-        lines = [l for l in lines if l != info.get("Branch Name", "")]
-        info["Account Name"] = " / ".join(lines)
+    # Account Name
+    name_m2 = re.search(r'Name\s+([A-Z][A-Z\s\.]+?)(?:\s+Branch|\n|$)', normalized_text, re.IGNORECASE)
+    if name_m2:
+        info["Account Name"] = name_m2.group(1).strip()
+    else:
+        name_m = re.search(r'((?:[A-Z][A-Z\s&\./]+\n)+)Name\n', normalized_text)
+        if name_m:
+            lines = [l.strip() for l in name_m.group(1).strip().split('\n') if l.strip()]
+            lines = [l for l in lines if l != info.get("Branch Name", "")]
+            info["Account Name"] = " / ".join(lines)
 
-    addr_blocks = list(re.finditer(r'Address\n', first_page_text))
-    if len(addr_blocks) >= 2:
-        start = addr_blocks[-1].end()
-        end_m = re.search(r'IFSC Code|MICR Code|A/c Type', first_page_text[start:])
-        addr_raw = first_page_text[start:start + end_m.start()] if end_m else first_page_text[start:start + 200]
-        addr_lines = [l.strip() for l in addr_raw.split('\n') if l.strip()]
+    # Address
+    addr_lines = []
+    lines = normalized_text.split('\n')
+    for line in lines:
+        line_clean = line.strip()
+        if not line_clean:
+            continue
+        # Skip if the line starts with a date (which indicates it's a transaction line)
+        words_in_line = line_clean.split()
+        if words_in_line and DATE_RE.match(words_in_line[0]):
+            continue
+        if 'Address' in line_clean and not 'LICI' in line_clean:
+            parts = re.split(r'Branch\s+Name|Address\s+LICI', line_clean, flags=re.IGNORECASE)
+            addr_part = parts[0].replace('Address', '').strip()
+            if addr_part:
+                addr_lines.append(addr_part)
+        elif any(k in line_clean for k in ['Phone', 'Account No.', 'Customer ID', 'Statement of', 'Date Particulars', 'Name ']):
+            continue
+        else:
+            if not any(k in line_clean for k in ['Branch Code', 'Branch Name', 'IFSC Code', 'MICR Code']):
+                parts = line_clean.split()
+                if len(parts) > 1:
+                    left_part = " ".join(parts[:len(parts)//2])
+                    if len(parts) == 2 and parts[0] == parts[1]:
+                        left_part = parts[0]
+                    addr_lines.append(left_part)
+                elif len(parts) == 1:
+                    addr_lines.append(parts[0])
+
+    if addr_lines:
         info["Address"] = ", ".join(addr_lines)
-    elif len(addr_blocks) == 1:
-        start = addr_blocks[0].end()
-        end_m = re.search(r'IFSC Code|MICR Code|A/c Type', first_page_text[start:])
-        addr_raw = first_page_text[start:start + end_m.start()] if end_m else first_page_text[start:start + 200]
-        addr_lines = [l.strip() for l in addr_raw.split('\n') if l.strip()]
-        info["Address"] = ", ".join(addr_lines)
+    else:
+        addr_blocks = list(re.finditer(r'Address\n', normalized_text))
+        if len(addr_blocks) >= 2:
+            start = addr_blocks[-1].end()
+            end_m = re.search(r'IFSC Code|MICR Code|A/c Type', normalized_text[start:])
+            addr_raw = normalized_text[start:start + end_m.start()] if end_m else normalized_text[start:start + 200]
+            addr_lines = [l.strip() for l in addr_raw.split('\n') if l.strip()]
+            info["Address"] = ", ".join(addr_lines)
+        elif len(addr_blocks) == 1:
+            start = addr_blocks[0].end()
+            end_m = re.search(r'IFSC Code|MICR Code|A/c Type', normalized_text[start:])
+            addr_raw = normalized_text[start:start + end_m.start()] if end_m else normalized_text[start:start + 200]
+            addr_lines = [l.strip() for l in addr_raw.split('\n') if l.strip()]
+            info["Address"] = ", ".join(addr_lines)
 
     return info
 
+
 def extract_uco_transactions(file_bytes: bytes, password: str | None = None) -> list[dict]:
     transactions = []
-    with open_pdf(file_bytes, password) as pdf:
-        for page in pdf.pages:
-            lines = words_to_lines(page)
+    
+    # 1. Determine if scanned or text-based
+    page1_text = extract_first_page_text(file_bytes, password)
+    is_scanned = len(page1_text.strip()) < 50
+    
+    if is_scanned:
+        # Image-based OCR flow
+        images = _cb_pdf_images(file_bytes, password)
+        if not images:
+            raise OcrSetupError("Could not render PDF pages.")
+            
+        show_progress = st.runtime.exists() and len(images) > 0
+        if show_progress:
+            progress_bar = st.progress(0, text=f"Processing Page 1 of {len(images)} (UCO OCR)...")
+            
+        completed = 0
+        
+        def process_page_uco_ocr(page_idx, img):
+            w_dim, h_dim = _uco_get_page_dimensions(file_bytes, page_idx, password)
+            words = extract_uco_words_ocr(img, w_dim, h_dim)
+            lines = group_words_to_lines(words)
+            page_txs = []
             for line_words in lines:
                 line_text = " ".join(w['text'] for w in line_words)
                 if is_disclaimer_text(line_text):
                     continue
                 if 'Opening Balance' in line_text:
                     continue
-                tx = parse_transaction_line(line_words)
+                tx = parse_uco_transaction_line(line_words)
                 if tx:
-                    transactions.append(tx)
-                elif transactions and line_words and not starts_new_transaction_row(line_words):
-                    continuation = [w['text'] for w in line_words if w['x0'] < 360 and not DATE_RE.match(w['text'])]
+                    page_txs.append(tx)
+                elif page_txs and line_words and not starts_new_transaction_row(line_words):
+                    continuation = [
+                        w['text'] for w in line_words 
+                        if w['x0'] < 360 and not DATE_RE.match(w['text'])
+                    ]
                     if continuation:
-                        extra = " ".join(continuation).strip()
+                        extra = " ".join(continuation).replace('|', '').strip()
                         if extra and not is_disclaimer_text(extra):
-                            if transactions[-1]['particulars']:
-                                transactions[-1]['particulars'] += " " + extra
+                            if page_txs[-1]['particulars']:
+                                page_txs[-1]['particulars'] += " " + extra
                             else:
-                                transactions[-1]['particulars'] = extra
+                                page_txs[-1]['particulars'] = extra
+            return page_txs
+
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        
+        results = [None] * len(images)
+        with ThreadPoolExecutor() as pool:
+            futures = {pool.submit(process_page_uco_ocr, idx, img): idx for idx, img in enumerate(images)}
+            for future in as_completed(futures):
+                idx = futures[future]
+                results[idx] = future.result()
+                completed += 1
+                if show_progress:
+                    progress_bar.progress(completed / len(images), text=f"Processing Page {completed} of {len(images)} (UCO OCR)...")
+                    
+            if show_progress:
+                progress_bar.empty()
+                
+            for page_txs in results:
+                if page_txs:
+                    transactions.extend(page_txs)
+    else:
+        # Text-based flow
+        with open_pdf(file_bytes, password) as pdf:
+            for page in pdf.pages:
+                words = page.extract_words(x_tolerance=4, y_tolerance=4)
+                lines = group_words_to_lines(words)
+                for line_words in lines:
+                    line_text = " ".join(w['text'] for w in line_words)
+                    if is_disclaimer_text(line_text):
+                        continue
+                    if 'Opening Balance' in line_text:
+                        continue
+                    tx = parse_uco_transaction_line(line_words)
+                    if tx:
+                        transactions.append(tx)
+                    elif transactions and line_words and not starts_new_transaction_row(line_words):
+                        continuation = [
+                            w['text'] for w in line_words 
+                            if w['x0'] < 360 and not DATE_RE.match(w['text'])
+                        ]
+                        if continuation:
+                            extra = " ".join(continuation).replace('|', '').strip()
+                            if extra and not is_disclaimer_text(extra):
+                                if transactions[-1]['particulars']:
+                                    transactions[-1]['particulars'] += " " + extra
+                                else:
+                                    transactions[-1]['particulars'] = extra
+                                    
     return transactions
 
 # ─── Router Logic ─────────────────────────────────────────────────────────────
@@ -584,8 +778,35 @@ def extract_canara_account_info(ocr_text: str) -> dict:
 
 def extract_canara_transactions(file_bytes: bytes, password: str | None = None) -> list[dict]:
     images = _cb_pdf_images(file_bytes, password)
+    
+    show_progress = st.runtime.exists() and len(images) > 0
+    if show_progress:
+        progress_bar = st.progress(0, text=f"Processing Page 1 of {len(images)} (Canara OCR)...")
+        
+    transactions = []
+    completed = 0
+    
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    
     try:
-        return [tx for img in images for tx in _cb_parse_page(img)]
+        with ThreadPoolExecutor() as pool:
+            futures = {pool.submit(_cb_parse_page, img): idx for idx, img in enumerate(images)}
+            results = [None] * len(images)
+            for future in as_completed(futures):
+                idx = futures[future]
+                results[idx] = future.result()
+                completed += 1
+                if show_progress:
+                    progress_bar.progress(completed / len(images), text=f"Processing Page {completed} of {len(images)} (Canara OCR)...")
+            
+            if show_progress:
+                progress_bar.empty()
+                
+            for res in results:
+                if res:
+                    transactions.extend(res)
+                    
+        return transactions
     except (pytesseract.TesseractNotFoundError, pytesseract.TesseractError) as exc:
         raise CanaraOcrSetupError(get_tesseract_help_message()) from exc
 
@@ -605,7 +826,13 @@ def parse_bank_statement(bank_name: str, file_bytes: bytes, page1_text: str, pas
     """Routes the PDF to the correct parsing logic based on the selected bank."""
     
     if bank_name == "UCO Bank":
-        account_info = extract_uco_account_info(page1_text)
+        is_scanned = len(page1_text.strip()) < 50
+        if is_scanned:
+            ocr_text = extract_uco_info_from_bytes(file_bytes, password)
+            account_info = extract_uco_account_info(ocr_text)
+        else:
+            account_info = extract_uco_account_info(page1_text)
+            
         transactions = extract_uco_transactions(file_bytes, password)
         return account_info, transactions
 
@@ -707,281 +934,286 @@ def build_excel_workbook(account_info: dict, transactions: list[dict], bank_name
     ws_tx.freeze_panes = "A2"
     return wb
 
-# ─── Streamlit UI ─────────────────────────────────────────────────────────────
-st.markdown("""
-<div class="app-header">
-  <div>
-    <h1>🏦 Bank Statement → Excel</h1>
-    <p>Deterministic extraction · Works offline · Multi-bank support</p>
-  </div>
-</div>
-""", unsafe_allow_html=True)
 
-# ── Mode selector ─────────────────────────────────────────────────────────────
-st.markdown("#### What do you want to do?")
-mode = st.radio(
-    label="mode",
-    options=["📊 Parse & Download Excel", "🤖 Extract Text for AI"],
-    horizontal=True,
-    label_visibility="collapsed",
-)
-st.caption(
-    "**Parse & Download Excel** — automatically extracts account details and all transactions into a styled Excel file."
-    if mode == "📊 Parse & Download Excel"
-    else "**Extract Text for AI** — pulls raw text from the PDF and builds a ready-to-paste prompt for ChatGPT, Claude, or Gemini."
-)
-
-st.divider()
-
-# ── Bank Selector ─────────────────────────────────────────────────────────────
-st.markdown("#### Select your Bank")
-selected_bank = st.selectbox(
-    label="bank",
-    options=["UCO Bank", "Canara Bank", "SBI (Coming Soon)", "HDFC (Coming Soon)"],
-    label_visibility="collapsed",
-)
-
-st.divider()
-
-# ── Upload ────────────────────────────────────────────────────────────────────
-uploaded_file = st.file_uploader(
-    f"Upload your {selected_bank} statement PDF",
-    type=["pdf"],
-    help="Supports text-based PDFs. Ensure the selected bank matches the uploaded document."
-)
-
-pdf_password = st.text_input(
-    "PDF password (optional)",
-    type="password",
-    help="Required only when the uploaded PDF is password protected.",
-)
-
-if not uploaded_file:
-    st.info("👆 Upload a bank statement PDF to get started.")
-    st.stop()
-
-submit = st.button("🚀 Process PDF", type="primary", use_container_width=False)
-
-if not submit:
-    st.stop()
-
-# BUG FIX: Read file bytes only ONCE
-file_bytes = uploaded_file.read()
-
-# ══════════════════════════════════════════════════════════════════════════════
-# MODE A — Parse & Download Excel
-# ══════════════════════════════════════════════════════════════════════════════
-if mode == "📊 Parse & Download Excel":
-
-    with st.spinner(f"Extracting data using {selected_bank} logic…"):
-        try:
-            page1_text = extract_first_page_text(file_bytes, pdf_password)
-            
-            # ROUTER CALLED HERE
-            account_info, transactions = parse_bank_statement(selected_bank, file_bytes, page1_text, pdf_password)
-            
-            with open_pdf(file_bytes, pdf_password) as _pdf:
-                page_count = len(_pdf.pages)
-        except PdfPasswordError as e:
-            st.error(str(e))
-            st.stop()
-        except CanaraOcrSetupError as e:
-            st.error(str(e))
-            st.stop()
-        except Exception as e:
-            st.error(f"Failed to read PDF: {e}")
-            st.stop()
-
-    if not transactions:
-        if selected_bank == "Canara Bank":
-            st.error(
-                "No Canara transactions found. OCR ran, but the app could not detect the transaction rows. "
-                "Check that the uploaded PDF is a Canara ePassbook/statement with the expected table layout, "
-                "and that the scan is clear enough for OCR."
-            )
-        else:
-            st.error("No transactions found. Make sure the PDF contains selectable text (not a scanned image).")
-        st.stop()
-
-    # ── Stats row ─────────────────────────────────────────────────────────────
-    total_withdrawals = sum(safe_float(tx["withdrawal"]) for tx in transactions if tx.get("withdrawal"))
-    total_deposits = sum(safe_float(tx["deposit"]) for tx in transactions if tx.get("deposit"))
-
-    st.markdown(f"""
-    <div class="stat-row">
-      <div class="stat-card">
-        <div class="stat-label">Transactions</div>
-        <div class="stat-value">{len(transactions)}</div>
-        <div class="stat-sub">{page_count} pages processed</div>
-      </div>
-      <div class="stat-card">
-        <div class="stat-label">Total Withdrawals</div>
-        <div class="stat-value" style="color:#C53030">₹{total_withdrawals:,.2f}</div>
-        <div class="stat-sub">Money out</div>
-      </div>
-      <div class="stat-card">
-        <div class="stat-label">Total Deposits</div>
-        <div class="stat-value" style="color:#276749">₹{total_deposits:,.2f}</div>
-        <div class="stat-sub">Money in</div>
-      </div>
-      <div class="stat-card">
-        <div class="stat-label">Closing Balance</div>
-        <div class="stat-value">₹{transactions[-1].get("balance","—")}</div>
-        <div class="stat-sub">{transactions[-1].get("date","")}</div>
+def main():
+    # ─── Streamlit UI ─────────────────────────────────────────────────────────────
+    st.markdown("""
+    <div class="app-header">
+      <div>
+        <h1>🏦 Bank Statement → Excel</h1>
+        <p>Deterministic extraction · Works offline · Multi-bank support</p>
       </div>
     </div>
     """, unsafe_allow_html=True)
 
-    # ── Download button ────────────────────────────────────────────────────────
-    wb = build_excel_workbook(account_info, transactions, selected_bank)
-    excel_buffer = io.BytesIO()
-    wb.save(excel_buffer)
-    excel_buffer.seek(0)
-
-    col_dl, col_spacer = st.columns([2, 5])
-    with col_dl:
-        st.download_button(
-            label="⬇️ Download Excel",
-            data=excel_buffer,
-            file_name=f"{uploaded_file.name.replace('.pdf', '')}_statement.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            use_container_width=True,
-            type="primary",
-        )
-
-    st.divider()
-
-    # ── Tabs ───────────────────────────────────────────────────────────────────
-    tab_info, tab_tx = st.tabs(["🏛️ Account Details", f"💳 Transactions ({len(transactions)})"])
-
-    with tab_info:
-        if not any(account_info.values()):
-            st.warning("Could not extract account details from this PDF automatically.")
-        else:
-            for label, value in account_info.items():
-                if value:
-                    col_label, col_value = st.columns([1, 2])
-                    with col_label:
-                        st.markdown(f"**{label}**")
-                    with col_value:
-                        st.code(value, language=None)
-
-    with tab_tx:
-        import pandas as pd
-
-        df = pd.DataFrame([{
-            "Date":            tx.get("date", ""),
-            "Particulars":     tx.get("particulars", ""),
-            "Withdrawal (₹)":  tx.get("withdrawal", ""),
-            "Deposit (₹)":     tx.get("deposit", ""),
-            "Balance (₹)":     tx.get("balance", ""),
-        } for tx in transactions])
-
-        st.markdown(f"**{len(transactions)} transactions** extracted from {page_count} pages")
-        st.dataframe(
-            df,
-            use_container_width=True,
-            height=520,
-            hide_index=True,
-            column_config={
-                "Date":           st.column_config.TextColumn("Date", width=110),
-                "Particulars":    st.column_config.TextColumn("Particulars", width=380),
-                "Withdrawal (₹)": st.column_config.TextColumn("Withdrawal (₹)", width=130),
-                "Deposit (₹)":    st.column_config.TextColumn("Deposit (₹)", width=130),
-                "Balance (₹)":    st.column_config.TextColumn("Balance (₹)", width=140),
-            }
-        )
-
-        empty_particulars = sum(1 for tx in transactions if not tx.get("particulars"))
-        if empty_particulars > 0:
-            st.markdown(f'<div class="warn-pill">⚠️ {empty_particulars} rows have empty Particulars — check column alignment</div>', unsafe_allow_html=True)
-        else:
-            st.markdown('<div class="success-pill">✅ All rows have Particulars</div>', unsafe_allow_html=True)
-
-# ══════════════════════════════════════════════════════════════════════════════
-# MODE B — Extract Text for AI
-# ══════════════════════════════════════════════════════════════════════════════
-else:
-    with st.spinner("Extracting text from PDF…"):
-        try:
-            pdf_text, page_count = extract_pdf_text(file_bytes, pdf_password)
-        except PdfPasswordError as e:
-            st.error(str(e))
-            st.stop()
-        except Exception as e:
-            st.error(f"Failed to read PDF: {e}")
-            st.stop()
-
-    if not pdf_text.strip():
-        st.error("No extractable text found. This PDF may be scanned/image-based.")
-        st.stop()
-
-    prompt = AI_EXCEL_PROMPT_TEMPLATE.format(pdf_text=pdf_text)
-
-    # ── Stats ──────────────────────────────────────────────────────────────────
-    st.markdown(f"""
-    <div class="stat-row">
-      <div class="stat-card">
-        <div class="stat-label">Pages</div>
-        <div class="stat-value">{page_count}</div>
-        <div class="stat-sub">extracted</div>
-      </div>
-      <div class="stat-card">
-        <div class="stat-label">Characters</div>
-        <div class="stat-value">{len(pdf_text):,}</div>
-        <div class="stat-sub">raw text</div>
-      </div>
-      <div class="stat-card">
-        <div class="stat-label">Prompt Size</div>
-        <div class="stat-value">{len(prompt):,}</div>
-        <div class="stat-sub">chars ready to paste</div>
-      </div>
-    </div>
-    """, unsafe_allow_html=True)
-
-    # ── Instructions ───────────────────────────────────────────────────────────
-    st.info(
-        "**How to use:** Download the prompt file below → open ChatGPT / Claude / Gemini "
-        "→ paste the entire contents → the AI will return two CSV blocks (Account Details + Transactions) "
-        "that you can copy into Excel."
+    # ── Mode selector ─────────────────────────────────────────────────────────────
+    st.markdown("#### What do you want to do?")
+    mode = st.radio(
+        label="mode",
+        options=["📊 Parse & Download Excel", "🤖 Extract Text for AI"],
+        horizontal=True,
+        label_visibility="collapsed",
+    )
+    st.caption(
+        "**Parse & Download Excel** — automatically extracts account details and all transactions into a styled Excel file."
+        if mode == "📊 Parse & Download Excel"
+        else "**Extract Text for AI** — pulls raw text from the PDF and builds a ready-to-paste prompt for ChatGPT, Claude, or Gemini."
     )
 
-    # ── Download buttons ───────────────────────────────────────────────────────
-    col1, col2, _spacer = st.columns([1, 1, 2])
+    st.divider()
 
-    with col1:
-        st.download_button(
-            label="⬇️ Download Full Prompt (.txt)",
-            data=prompt,
-            file_name=f"{uploaded_file.name.replace('.pdf', '')}_ai_prompt.txt",
-            mime="text/plain",
-            use_container_width=True,
-            type="primary",
-        )
-    with col2:
-        st.download_button(
-            label="⬇️ Download Raw Text Only",
-            data=pdf_text,
-            file_name=f"{uploaded_file.name.replace('.pdf', '')}_extracted_text.txt",
-            mime="text/plain",
-            use_container_width=True,
-        )
+    # ── Bank Selector ─────────────────────────────────────────────────────────────
+    st.markdown("#### Select your Bank")
+    selected_bank = st.selectbox(
+        label="bank",
+        options=["UCO Bank", "Canara Bank", "SBI (Coming Soon)", "HDFC (Coming Soon)"],
+        label_visibility="collapsed",
+    )
 
     st.divider()
 
-    # ── Preview tabs ───────────────────────────────────────────────────────────
-    tab_prompt_prev, tab_text_prev = st.tabs(["📋 Prompt Preview", "📄 Raw Text Preview"])
+    # ── Upload ────────────────────────────────────────────────────────────────────
+    uploaded_file = st.file_uploader(
+        f"Upload your {selected_bank} statement PDF",
+        type=["pdf"],
+        help="Supports text-based PDFs. Ensure the selected bank matches the uploaded document."
+    )
 
-    with tab_prompt_prev:
-        st.caption("First 3000 characters of the full prompt")
-        st.code(
-            prompt[:3000] + ("\n\n… (truncated — download for full prompt)" if len(prompt) > 3000 else ""),
-            language=None
+    pdf_password = st.text_input(
+        "PDF password (optional)",
+        type="password",
+        help="Required only when the uploaded PDF is password protected.",
+    )
+
+    if not uploaded_file:
+        st.info("👆 Upload a bank statement PDF to get started.")
+        st.stop()
+
+    submit = st.button("🚀 Process PDF", type="primary", use_container_width=False)
+
+    if not submit:
+        st.stop()
+
+    # BUG FIX: Read file bytes only ONCE
+    file_bytes = uploaded_file.read()
+
+    # ══════════════════════════════════════════════════════════════════════════════
+    # MODE A — Parse & Download Excel
+    # ══════════════════════════════════════════════════════════════════════════════
+    if mode == "📊 Parse & Download Excel":
+
+        with st.spinner(f"Extracting data using {selected_bank} logic…"):
+            try:
+                page1_text = extract_first_page_text(file_bytes, pdf_password)
+            
+                # ROUTER CALLED HERE
+                account_info, transactions = parse_bank_statement(selected_bank, file_bytes, page1_text, pdf_password)
+            
+                with open_pdf(file_bytes, pdf_password) as _pdf:
+                    page_count = len(_pdf.pages)
+            except PdfPasswordError as e:
+                st.error(str(e))
+                st.stop()
+            except CanaraOcrSetupError as e:
+                st.error(str(e))
+                st.stop()
+            except Exception as e:
+                st.error(f"Failed to read PDF: {e}")
+                st.stop()
+
+        if not transactions:
+            if selected_bank == "Canara Bank":
+                st.error(
+                    "No Canara transactions found. OCR ran, but the app could not detect the transaction rows. "
+                    "Check that the uploaded PDF is a Canara ePassbook/statement with the expected table layout, "
+                    "and that the scan is clear enough for OCR."
+                )
+            else:
+                st.error("No transactions found. Make sure the PDF contains selectable text (not a scanned image).")
+            st.stop()
+
+        # ── Stats row ─────────────────────────────────────────────────────────────
+        total_withdrawals = sum(safe_float(tx["withdrawal"]) for tx in transactions if tx.get("withdrawal"))
+        total_deposits = sum(safe_float(tx["deposit"]) for tx in transactions if tx.get("deposit"))
+
+        st.markdown(f"""
+        <div class="stat-row">
+          <div class="stat-card">
+            <div class="stat-label">Transactions</div>
+            <div class="stat-value">{len(transactions)}</div>
+            <div class="stat-sub">{page_count} pages processed</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-label">Total Withdrawals</div>
+            <div class="stat-value" style="color:#C53030">₹{total_withdrawals:,.2f}</div>
+            <div class="stat-sub">Money out</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-label">Total Deposits</div>
+            <div class="stat-value" style="color:#276749">₹{total_deposits:,.2f}</div>
+            <div class="stat-sub">Money in</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-label">Closing Balance</div>
+            <div class="stat-value">₹{transactions[-1].get("balance","—")}</div>
+            <div class="stat-sub">{transactions[-1].get("date","")}</div>
+          </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        # ── Download button ────────────────────────────────────────────────────────
+        wb = build_excel_workbook(account_info, transactions, selected_bank)
+        excel_buffer = io.BytesIO()
+        wb.save(excel_buffer)
+        excel_buffer.seek(0)
+
+        col_dl, col_spacer = st.columns([2, 5])
+        with col_dl:
+            st.download_button(
+                label="⬇️ Download Excel",
+                data=excel_buffer,
+                file_name=f"{uploaded_file.name.replace('.pdf', '')}_statement.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+                type="primary",
+            )
+
+        st.divider()
+
+        # ── Tabs ───────────────────────────────────────────────────────────────────
+        tab_info, tab_tx = st.tabs(["🏛️ Account Details", f"💳 Transactions ({len(transactions)})"])
+
+        with tab_info:
+            if not any(account_info.values()):
+                st.warning("Could not extract account details from this PDF automatically.")
+            else:
+                for label, value in account_info.items():
+                    if value:
+                        col_label, col_value = st.columns([1, 2])
+                        with col_label:
+                            st.markdown(f"**{label}**")
+                        with col_value:
+                            st.code(value, language=None)
+
+        with tab_tx:
+            import pandas as pd
+
+            df = pd.DataFrame([{
+                "Date":            tx.get("date", ""),
+                "Particulars":     tx.get("particulars", ""),
+                "Withdrawal (₹)":  tx.get("withdrawal", ""),
+                "Deposit (₹)":     tx.get("deposit", ""),
+                "Balance (₹)":     tx.get("balance", ""),
+            } for tx in transactions])
+
+            st.markdown(f"**{len(transactions)} transactions** extracted from {page_count} pages")
+            st.dataframe(
+                df,
+                use_container_width=True,
+                height=520,
+                hide_index=True,
+                column_config={
+                    "Date":           st.column_config.TextColumn("Date", width=110),
+                    "Particulars":    st.column_config.TextColumn("Particulars", width=380),
+                    "Withdrawal (₹)": st.column_config.TextColumn("Withdrawal (₹)", width=130),
+                    "Deposit (₹)":    st.column_config.TextColumn("Deposit (₹)", width=130),
+                    "Balance (₹)":    st.column_config.TextColumn("Balance (₹)", width=140),
+                }
+            )
+
+            empty_particulars = sum(1 for tx in transactions if not tx.get("particulars"))
+            if empty_particulars > 0:
+                st.markdown(f'<div class="warn-pill">⚠️ {empty_particulars} rows have empty Particulars — check column alignment</div>', unsafe_allow_html=True)
+            else:
+                st.markdown('<div class="success-pill">✅ All rows have Particulars</div>', unsafe_allow_html=True)
+
+    # ══════════════════════════════════════════════════════════════════════════════
+    # MODE B — Extract Text for AI
+    # ══════════════════════════════════════════════════════════════════════════════
+    else:
+        with st.spinner("Extracting text from PDF…"):
+            try:
+                pdf_text, page_count = extract_pdf_text(file_bytes, pdf_password)
+            except PdfPasswordError as e:
+                st.error(str(e))
+                st.stop()
+            except Exception as e:
+                st.error(f"Failed to read PDF: {e}")
+                st.stop()
+
+        if not pdf_text.strip():
+            st.error("No extractable text found. This PDF may be scanned/image-based.")
+            st.stop()
+
+        prompt = AI_EXCEL_PROMPT_TEMPLATE.format(pdf_text=pdf_text)
+
+        # ── Stats ──────────────────────────────────────────────────────────────────
+        st.markdown(f"""
+        <div class="stat-row">
+          <div class="stat-card">
+            <div class="stat-label">Pages</div>
+            <div class="stat-value">{page_count}</div>
+            <div class="stat-sub">extracted</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-label">Characters</div>
+            <div class="stat-value">{len(pdf_text):,}</div>
+            <div class="stat-sub">raw text</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-label">Prompt Size</div>
+            <div class="stat-value">{len(prompt):,}</div>
+            <div class="stat-sub">chars ready to paste</div>
+          </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        # ── Instructions ───────────────────────────────────────────────────────────
+        st.info(
+            "**How to use:** Download the prompt file below → open ChatGPT / Claude / Gemini "
+            "→ paste the entire contents → the AI will return two CSV blocks (Account Details + Transactions) "
+            "that you can copy into Excel."
         )
 
-    with tab_text_prev:
-        st.caption(f"First 3000 characters of extracted text ({page_count} pages total)")
-        st.code(
-            pdf_text[:3000] + ("\n\n… (truncated)" if len(pdf_text) > 3000 else ""),
-            language=None
-        )
+        # ── Download buttons ───────────────────────────────────────────────────────
+        col1, col2, _spacer = st.columns([1, 1, 2])
+
+        with col1:
+            st.download_button(
+                label="⬇️ Download Full Prompt (.txt)",
+                data=prompt,
+                file_name=f"{uploaded_file.name.replace('.pdf', '')}_ai_prompt.txt",
+                mime="text/plain",
+                use_container_width=True,
+                type="primary",
+            )
+        with col2:
+            st.download_button(
+                label="⬇️ Download Raw Text Only",
+                data=pdf_text,
+                file_name=f"{uploaded_file.name.replace('.pdf', '')}_extracted_text.txt",
+                mime="text/plain",
+                use_container_width=True,
+            )
+
+        st.divider()
+
+        # ── Preview tabs ───────────────────────────────────────────────────────────
+        tab_prompt_prev, tab_text_prev = st.tabs(["📋 Prompt Preview", "📄 Raw Text Preview"])
+
+        with tab_prompt_prev:
+            st.caption("First 3000 characters of the full prompt")
+            st.code(
+                prompt[:3000] + ("\n\n… (truncated — download for full prompt)" if len(prompt) > 3000 else ""),
+                language=None
+            )
+
+        with tab_text_prev:
+            st.caption(f"First 3000 characters of extracted text ({page_count} pages total)")
+            st.code(
+                pdf_text[:3000] + ("\n\n… (truncated)" if len(pdf_text) > 3000 else ""),
+                language=None
+            )
+
+if __name__ == "__main__":
+    main()
