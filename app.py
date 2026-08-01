@@ -641,12 +641,25 @@ def extract_uco_transactions(file_bytes: bytes, password: str | None = None) -> 
 
 # ─── Router Logic ─────────────────────────────────────────────────────────────
 # Canara Bank Parser
-_CB_X_DATE_MAX        = 340
-_CB_X_PARTICULARS_MAX = 880
-_CB_X_DEPOSITS_MAX    = 1140
-_CB_X_WITHDRAWALS_MAX = 1440
+# Column x-boundaries (PDF pts, 595x842 A4 portrait) — calibrated from real PDF
+#   Date:        x0  ~26–88   (format DD-MM-YYYY)
+#   Particulars: x0 ~106–284
+#   Deposits:    x0 ~320–395
+#   Withdrawals: x0 ~413–490
+#   Balance:     x0 ~517–581
+_CB_X_DATE_MAX        = 100     # Date column x1 max
+_CB_X_PARTICULARS_MAX = 310     # Particulars column x1 max
+_CB_X_DEPOSITS_MAX    = 410     # Deposits column x1 max
+_CB_X_WITHDRAWALS_MAX = 510     # Withdrawals column x1 max
+# Balance: x0 >= 510
 
-_CB_DATE_RE   = re.compile(r'^\d{2}[-/.\s]\d{2}[-/.\s]\d{2,4}$')
+# OCR-mode constants (pixel coords at 200 DPI, used when text extraction fails)
+_CB_X_DATE_MAX_PX        = 340
+_CB_X_PARTICULARS_MAX_PX = 880
+_CB_X_DEPOSITS_MAX_PX    = 1140
+_CB_X_WITHDRAWALS_MAX_PX = 1440
+
+_CB_DATE_RE   = re.compile(r'^\d{2}[-/.]\d{2}[-/.]\d{2,4}$')
 _CB_NUMBER_RE = re.compile(r'^\d[\d,]*(?:\.\d{1,2})?$')
 _CB_CHQ_RE    = re.compile(r'^chq[;:.]?$', re.IGNORECASE)
 _CB_NOISE_RE  = re.compile(
@@ -657,6 +670,104 @@ _CB_NOISE_RE  = re.compile(
     re.IGNORECASE
 )
 
+
+# ── Text-based helpers ──────────────────────────────────────────────────────
+
+def _cb_normalize_date(text: str) -> str:
+    normalized = text.strip().replace("O", "0").replace("o", "0")
+    normalized = re.sub(r'[-/.\s]+', '-', normalized)
+    if not re.match(r'^\d{2}-\d{2}-\d{2,4}$', normalized):
+        return ""
+    day, month, year = normalized.split("-")
+    if len(year) == 2:
+        year = "20" + year
+    return f"{day}-{month}-{year}"
+
+
+def _cb_normalize_amount(text: str) -> str:
+    normalized = re.sub(r'[^\d,.]', '', text.strip()).strip(',.')
+    return normalized if _CB_NUMBER_RE.match(normalized) else ""
+
+
+def _cb_parse_page_text(page) -> list[dict]:
+    """Parse one pdfplumber page using word coordinates. Returns [] if no dates found."""
+    words = page.extract_words(x_tolerance=3, y_tolerance=3)
+    if not words:
+        return []
+
+    # Bucket words into visual lines by top coordinate (6-pt bucket)
+    from collections import defaultdict
+    buckets: dict[int, list] = defaultdict(list)
+    for w in words:
+        buckets[round(w['top'] / 6)].append(w)
+
+    transactions: list[dict] = []
+    pending_particulars: list[str] = []   # narration lines before the date line
+
+    for key in sorted(buckets):
+        line_words = sorted(buckets[key], key=lambda w: w['x0'])
+        dates, deposits, withdrawals, balances, narration = [], [], [], [], []
+
+        for w in line_words:
+            t  = w['text'].strip()
+            x0 = w.get('x0', 0)
+            x1 = w.get('x1', x0)
+            if not t:
+                continue
+
+            if x1 <= _CB_X_DATE_MAX:
+                d = _cb_normalize_date(t)
+                if d:
+                    dates.append(d)
+            elif x1 <= _CB_X_PARTICULARS_MAX:
+                # Skip noise words and account-header tokens (masked IDs, phone numbers)
+                is_noise = _CB_NOISE_RE.match(t) or len(t) <= 1
+                is_masked = bool(re.match(r'^X{4,}', t))       # e.g. XXXXXXXXX2099
+                is_phone  = bool(re.match(r'^\+?\d{8,}$', t))  # e.g. +917084540416
+                if not (is_noise or is_masked or is_phone):
+                    narration.append(t)
+
+            elif x1 <= _CB_X_DEPOSITS_MAX:
+                a = _cb_normalize_amount(t)
+                if a and '.' in a:   # require decimal point — avoids picking up stray integers
+                    deposits.append(a)
+            elif x1 <= _CB_X_WITHDRAWALS_MAX:
+                a = _cb_normalize_amount(t)
+                if a and '.' in a:
+                    withdrawals.append(a)
+            else:  # Balance column
+                a = _cb_normalize_amount(t)
+                if a and '.' in a:
+                    balances.append(a)
+
+        if dates:
+            # Flush any pending narration lines accumulated before this date line
+            combined_narration = ' '.join(pending_particulars + narration).strip()
+            pending_particulars = []
+            if balances:   # Only emit if we have a balance (confirms it's a real txn row)
+                transactions.append({
+                    'date':        dates[-1],
+                    'particulars': combined_narration,
+                    'deposit':     deposits[-1]    if deposits    else '',
+                    'withdrawal':  withdrawals[-1] if withdrawals else '',
+                    'balance':     balances[-1],
+                })
+        elif narration and not deposits and not withdrawals and not balances:
+            # Pure narration continuation line — buffer it
+            pending_particulars.extend(narration)
+        elif (deposits or withdrawals or balances) and transactions:
+            # Amount-only continuation — append to last transaction
+            if deposits:
+                transactions[-1]['deposit'] = transactions[-1]['deposit'] or deposits[-1]
+            if withdrawals:
+                transactions[-1]['withdrawal'] = transactions[-1]['withdrawal'] or withdrawals[-1]
+            if balances:
+                transactions[-1]['balance'] = balances[-1]
+
+    return transactions
+
+
+# ── OCR-based helpers (unchanged, used as fallback) ─────────────────────────
 
 def _cb_pdf_images(file_bytes: bytes, password: str | None = None, **kwargs):
     password = normalize_pdf_password(password)
@@ -723,26 +834,8 @@ def _cb_confidence_ok(confidence: str) -> bool:
         return False
 
 
-def _cb_normalize_date(text: str) -> str:
-    normalized = text.strip().replace("O", "0").replace("o", "0")
-    normalized = re.sub(r'[-/.\s]+', '-', normalized)
-    if not _CB_DATE_RE.match(text.strip()) and not re.match(r'^\d{2}-\d{2}-\d{2,4}$', normalized):
-        return ""
-    day, month, year = normalized.split("-")
-    if len(year) == 2:
-        year = "20" + year
-    return f"{day}-{month}-{year}"
-
-
-def _cb_normalize_amount(text: str) -> str:
-    normalized = re.sub(r'[^\d,.]', '', text.strip())
-    normalized = normalized.strip(',.')
-    if not _CB_NUMBER_RE.match(normalized):
-        return ""
-    return normalized
-
-
-def _cb_parse_page(img) -> list[dict]:
+def _cb_parse_page_ocr(img) -> list[dict]:
+    """OCR fallback: parse a PIL image of one page into transactions."""
     data = pytesseract.image_to_data(img, output_type=pytesseract.Output.DICT)
     words = [
         {'text': t.strip(), 'x': data['left'][i], 'y': data['top'][i]}
@@ -755,7 +848,7 @@ def _cb_parse_page(img) -> list[dict]:
     dates = []
     for w in words:
         date = _cb_normalize_date(w['text'])
-        if date and w['x'] < _CB_X_DATE_MAX:
+        if date and w['x'] < _CB_X_DATE_MAX_PX:
             dates.append((w['y'], date))
     if not dates:
         return []
@@ -778,17 +871,17 @@ def _cb_parse_page(img) -> list[dict]:
 
         for w in words:
             x, y, t = w['x'], w['y'], w['text']
-            if x < _CB_X_DATE_MAX:
+            if x < _CB_X_DATE_MAX_PX:
                 continue
-            elif x < _CB_X_PARTICULARS_MAX:
+            elif x < _CB_X_PARTICULARS_MAX_PX:
                 if part_start_y <= y < own_chq_y and not _CB_NOISE_RE.match(t) and len(t) > 1:
                     particulars_parts.append((y, x, t))
             elif date_y <= y < next_date_y:
                 amount = _cb_normalize_amount(t)
-                if x < _CB_X_DEPOSITS_MAX:
+                if x < _CB_X_DEPOSITS_MAX_PX:
                     if amount:
                         deposits.append(amount)
-                elif x < _CB_X_WITHDRAWALS_MAX:
+                elif x < _CB_X_WITHDRAWALS_MAX_PX:
                     if amount:
                         withdrawals.append(amount)
                 else:
@@ -835,27 +928,42 @@ def extract_canara_account_info(ocr_text: str) -> dict:
 
 
 def extract_canara_transactions(file_bytes: bytes, password: str | None = None) -> list[dict]:
+    """Try text-based extraction first; fall back to OCR if page has no text."""
     page_count = get_pdf_page_count(file_bytes, password)
     if page_count == 0:
         return []
-        
+
+    # ── Pass 1: attempt text-based extraction ───────────────────────────────
+    try:
+        with open_pdf(file_bytes, password) as pdf:
+            all_text = ''.join((p.extract_text() or '') for p in pdf.pages)
+        if len(all_text.strip()) >= 50:
+            # PDF has real text — use fast coordinate-based parser
+            transactions: list[dict] = []
+            with open_pdf(file_bytes, password) as pdf:
+                for page in pdf.pages:
+                    transactions.extend(_cb_parse_page_text(page))
+            return transactions
+    except Exception:
+        pass   # Fall through to OCR
+
+    # ── Pass 2: OCR fallback ─────────────────────────────────────────────────
     show_progress = st.runtime.exists() and page_count > 0
     if show_progress:
         progress_bar = st.progress(0, text=f"Processing Page 1 of {page_count} (Canara OCR)...")
-        
+
     transactions = []
     completed = 0
-    
+
     from concurrent.futures import ThreadPoolExecutor, as_completed
-    
+
     def process_page_canara_ocr(page_idx):
         img = render_pdf_page_as_image(file_bytes, page_idx, password)
         if img is None:
             return []
-        return _cb_parse_page(img)
-        
+        return _cb_parse_page_ocr(img)
+
     try:
-        # Limit max_workers=2 to prevent hitting Streamlit Cloud memory limits
         with ThreadPoolExecutor(max_workers=2) as pool:
             futures = {pool.submit(process_page_canara_ocr, idx): idx for idx in range(page_count)}
             results = [None] * page_count
@@ -865,20 +973,30 @@ def extract_canara_transactions(file_bytes: bytes, password: str | None = None) 
                 completed += 1
                 if show_progress:
                     progress_bar.progress(completed / page_count, text=f"Processing Page {completed} of {page_count} (Canara OCR)...")
-            
             if show_progress:
                 progress_bar.empty()
-                
+
             for res in results:
                 if res:
                     transactions.extend(res)
-                    
+
         return transactions
     except (pytesseract.TesseractNotFoundError, pytesseract.TesseractError) as exc:
         raise CanaraOcrSetupError(get_tesseract_help_message()) from exc
 
 
 def extract_canara_info_from_bytes(file_bytes: bytes, password: str | None = None) -> dict:
+    """Try text-based info extraction first; fall back to OCR."""
+    # ── Pass 1: text-based ───────────────────────────────────────────────────
+    try:
+        with open_pdf(file_bytes, password) as pdf:
+            page1_text = pdf.pages[0].extract_text() or '' if pdf.pages else ''
+        if len(page1_text.strip()) >= 50:
+            return extract_canara_account_info(page1_text)
+    except Exception:
+        pass
+
+    # ── Pass 2: OCR fallback ─────────────────────────────────────────────────
     img = render_pdf_page_as_image(file_bytes, 0, password)
     if not img:
         raise CanaraOcrSetupError("Could not render the first page of the PDF.")
@@ -887,6 +1005,205 @@ def extract_canara_info_from_bytes(file_bytes: bytes, password: str | None = Non
     except (pytesseract.TesseractNotFoundError, pytesseract.TesseractError) as exc:
         raise CanaraOcrSetupError(get_tesseract_help_message()) from exc
     return extract_canara_account_info(ocr_text)
+
+
+
+
+# ─── Central Bank of India Parser ────────────────────────────────────────────
+# Column x-boundaries in PDF points — calibrated from real PDF (648 x 936 pts)
+#   Value Date:  x0 ~36–75
+#   Post Date:   x0 ~90–128
+#   Details:     x0 ~144–260
+#   Chq.No:      x0 ~261–320   (always "-", skip)
+#   Debit:       x0 ~351–420
+#   Credit:      x0 ~417–530
+#   Balance:     x0 ~508–620   (has "Cr"/"Dr" suffix)
+_CBI_X_VALUE_DATE_MAX = 80      # Value date ends here
+_CBI_X_POST_DATE_MAX  = 140     # Post date ends here
+_CBI_X_DETAILS_MAX    = 260     # Details/narration ends here
+_CBI_X_CHQ_MAX        = 345     # Chq.No ends here (always "-")
+_CBI_X_DEBIT_MAX      = 420     # Debit ends here
+_CBI_X_CREDIT_MAX     = 530     # Credit ends here
+# Balance: everything with x0 > 500
+
+_CBI_DATE_RE   = re.compile(r'^\d{2}/\d{2}/\d{2,4}$')
+_CBI_AMOUNT_RE = re.compile(r'^[\d,]+\.\d{2}(Cr|Dr)?$', re.IGNORECASE)
+_CBI_NOISE_WORDS = {
+    'brought', 'forward', 'carried', 'statement', 'account',
+    'page', 'no', 'value', 'post', 'date', 'details',
+    'chq', 'chq.no.', 'debit', 'credit', 'balance',
+}
+
+
+def _cbi_clean_amount(s: str) -> str:
+    """Strip Cr/Dr suffix and return clean numeric string."""
+    return re.sub(r'(Cr|Dr)$', '', s, flags=re.IGNORECASE).strip()
+
+
+def _cbi_parse_line(line_words: list[dict]) -> dict | None:
+    """Parse one CBI transaction line.
+    
+    Column layout (PDF pts, 648x936 page):
+      Value Date: x0 36-75
+      Post Date:  x0 90-128
+      Details:    x0 144-260 (narration text)
+      Chq.No:     x0 261-320  (always '-')
+      Debit(TO):  x0 353-392  (x1 ~392)
+      Credit(BY): x0 453-491  (x1 ~491)
+      Balance:    x0 571-619  (has Cr/Dr suffix)
+    
+    Note: 'TO TRF' = withdrawal (debit), 'BY TRF' = deposit (credit).
+    Amounts live in slightly different x zones.
+    Returns None if no Value Date anchor found.
+    """
+    dates, details, amounts_debit, amounts_credit, balances = [], [], [], [], []
+    
+    for w in line_words:
+        t  = w['text'].strip()
+        x0 = w.get('x0', 0)
+        x1 = w.get('x1', x0)
+
+        if not t or t in ('.', '-', ':'):
+            continue
+        if t.startswith('_'):
+            continue
+
+        # Value Date column (x1 <= 80)
+        if x1 <= _CBI_X_VALUE_DATE_MAX:
+            if _CBI_DATE_RE.match(t):
+                dates.append(t)
+        # Post Date column (x1 <= 140) — skip
+        elif x1 <= _CBI_X_POST_DATE_MAX:
+            pass
+        # Details/narration (x1 <= 260)
+        elif x1 <= _CBI_X_DETAILS_MAX:
+            if t.lower() not in _CBI_NOISE_WORDS:
+                details.append(t)
+        # Chq.No column (x1 <= 345) — skip
+        elif x1 <= _CBI_X_CHQ_MAX:
+            pass
+        # Amount zone: x0 ~350-500, split into debit vs credit by x0
+        elif x0 >= 340 and x1 <= 510:
+            cleaned = _cbi_clean_amount(t)
+            if re.match(r'^[\d,]+\.\d{2}$', cleaned):
+                if x0 <= 420:   # ~354-392: debit/withdrawal (TO TRF)
+                    amounts_debit.append(cleaned)
+                else:            # ~453-491: credit/deposit (BY TRF)
+                    amounts_credit.append(cleaned)
+        # Balance column (x0 >= 508)
+        elif x0 >= 508:
+            if _CBI_AMOUNT_RE.match(t):
+                balances.append(_cbi_clean_amount(t))
+
+    if not dates:
+        return None
+
+    # Normalise date DD/MM/YY → DD-MM-YYYY
+    raw_date = dates[-1]
+    parts = raw_date.split('/')
+    if len(parts) == 3 and len(parts[2]) == 2:
+        parts[2] = '20' + parts[2]
+    date_str = '-'.join(parts)
+
+    return {
+        'date':        date_str,
+        'particulars': ' '.join(details).strip(),
+        'withdrawal':  amounts_debit[-1]   if amounts_debit   else '',
+        'deposit':     amounts_credit[-1]  if amounts_credit  else '',
+        'balance':     balances[-1]        if balances        else '',
+    }
+
+
+def _cbi_reconstruct_balance(transactions: list[dict]) -> list[dict]:
+    """Forward-fill missing balance values from running balance."""
+    def to_f(s: str) -> float | None:
+        try:
+            return float(s.replace(',', '').strip())
+        except (ValueError, AttributeError):
+            return None
+
+    prev_bal: float | None = None
+    for tx in transactions:
+        bal = to_f(tx.get('balance', ''))
+        dep = to_f(tx.get('deposit', '')) or 0.0
+        wd  = to_f(tx.get('withdrawal', '')) or 0.0
+        if bal is not None:
+            prev_bal = bal
+        elif prev_bal is not None:
+            reconstructed = prev_bal + dep - wd
+            tx['balance'] = f"{reconstructed:,.2f}"
+            prev_bal = reconstructed
+    return transactions
+
+
+def extract_central_bank_transactions(
+    file_bytes: bytes, password: str | None = None
+) -> list[dict]:
+    transactions: list[dict] = []
+    with open_pdf(file_bytes, password) as pdf:
+        for page in pdf.pages:
+            words = page.extract_words(x_tolerance=3, y_tolerance=3)
+
+            # Simple line grouper: bucket words by top coordinate.
+            # We intentionally do NOT use group_words_to_lines() here because
+            # that function calls starts_new_transaction_row() (UCO-specific),
+            # which splits the line on the date word — before amounts are seen.
+            from collections import defaultdict
+            buckets: dict[int, list] = defaultdict(list)
+            for w in words:
+                key = round(w['top'] / 8)   # 8-pt bucket, tight enough for CBI line spacing
+                buckets[key].append(w)
+
+            for key in sorted(buckets):
+                line_words = sorted(buckets[key], key=lambda w: w['x0'])
+                line_text = ' '.join(w['text'] for w in line_words)
+
+                # Skip pure header/separator/noise lines
+                if line_text.startswith('_') or 'STATEMENT OF ACCOUNT' in line_text:
+                    continue
+                if all(w['text'] in ('.', '-', ':') for w in line_words):
+                    continue
+
+                tx = _cbi_parse_line(line_words)
+                if tx:
+                    transactions.append(tx)
+                elif transactions and line_words:
+                    # Continuation narration line (no date, but has details text)
+                    extra_parts = [
+                        w['text'] for w in line_words
+                        if w.get('x0', 0) >= 144 and w.get('x1', 0) <= _CBI_X_DETAILS_MAX
+                        and w['text'] not in ('.', '-', ':')
+                        and w['text'].lower() not in _CBI_NOISE_WORDS
+                    ]
+                    if extra_parts:
+                        extra = ' '.join(extra_parts).strip()
+                        if extra:
+                            sep = ' ' if transactions[-1]['particulars'] else ''
+                            transactions[-1]['particulars'] += sep + extra
+
+    return _cbi_reconstruct_balance(transactions)
+
+
+
+def extract_central_bank_info_from_bytes(
+    file_bytes: bytes, password: str | None = None
+) -> dict:
+    """Extract account meta-data from the first page text of a CBI statement."""
+    info: dict = {}
+    try:
+        with open_pdf(file_bytes, password) as pdf:
+            text = pdf.pages[0].extract_text() or ''
+    except Exception:
+        return info
+
+    patterns = {
+        'Account Type':     r'(?:Account\s*Type|A/c\s*Type)[.:]?\s*([A-Za-z\s]+?)(?:\n|$)',
+        'Customer ID':      r'(?:Customer\s*ID|CIF)[.:]?\s*([A-Z0-9]+)',
+    }
+    for field, pattern in patterns.items():
+        m = re.search(pattern, text, re.IGNORECASE)
+        info[field] = m.group(1).strip() if m else ''
+    return info
 
 
 def parse_bank_statement(bank_name: str, file_bytes: bytes, page1_text: str, password: str | None = None):
@@ -907,14 +1224,19 @@ def parse_bank_statement(bank_name: str, file_bytes: bytes, page1_text: str, pas
         account_info = extract_canara_info_from_bytes(file_bytes, password)
         transactions = extract_canara_transactions(file_bytes, password)
         return account_info, transactions
+
+    elif bank_name == "Central Bank of India":
+        account_info = extract_central_bank_info_from_bytes(file_bytes, password)
+        transactions = extract_central_bank_transactions(file_bytes, password)
+        return account_info, transactions
+
+    # elif bank_name == "SBI (Coming Soon)":
+    #     st.warning("SBI parsing logic is not yet implemented. Please check back later!")
+    #     st.stop()
         
-    elif bank_name == "SBI (Coming Soon)":
-        st.warning("SBI parsing logic is not yet implemented. Please check back later!")
-        st.stop()
-        
-    elif bank_name == "HDFC (Coming Soon)":
-        st.warning("HDFC parsing logic is not yet implemented. Please check back later!")
-        st.stop()
+    # elif bank_name == "HDFC (Coming Soon)":
+    #     st.warning("HDFC parsing logic is not yet implemented. Please check back later!")
+    #     st.stop()
         
     else:
         st.error("Unsupported bank selected.")
@@ -1033,7 +1355,7 @@ def main():
     st.markdown("#### Select your Bank")
     selected_bank = st.selectbox(
         label="bank",
-        options=["UCO Bank", "Canara Bank", "SBI (Coming Soon)", "HDFC (Coming Soon)"],
+        options=["UCO Bank", "Canara Bank", "Central Bank of India", "SBI (Coming Soon)", "HDFC (Coming Soon)"],
         label_visibility="collapsed",
     )
 
