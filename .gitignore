@@ -6,3 +6,4 @@ venv/
 .streamlit/secrets.toml
 test.py
 pdfs/
+outputs/

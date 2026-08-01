@@ -352,12 +352,67 @@ def parse_uco_transaction_line(line_words: list[dict]) -> dict | None:
     }
 
 # ─── Bank Specific Parsers ────────────────────────────────────────────────────
+def get_pdf_page_count(file_bytes: bytes, password: str | None = None) -> int:
+    password = normalize_pdf_password(password)
+    if fitz is not None:
+        try:
+            doc = fitz.open(stream=file_bytes, filetype="pdf")
+            if doc.needs_pass:
+                if password:
+                    doc.authenticate(password)
+            count = doc.page_count
+            doc.close()
+            return count
+        except Exception:
+            pass
+    try:
+        with open_pdf(file_bytes, password) as pdf:
+            return len(pdf.pages)
+    except Exception:
+        return 0
+
+
+def render_pdf_page_as_image(file_bytes: bytes, page_index: int, password: str | None = None, dpi: int = 200) -> Image.Image | None:
+    password = normalize_pdf_password(password)
+    if fitz is not None:
+        try:
+            doc = fitz.open(stream=file_bytes, filetype="pdf")
+            if doc.needs_pass:
+                if password:
+                    doc.authenticate(password)
+            page = doc.load_page(page_index)
+            scale = dpi / 72.0
+            matrix = fitz.Matrix(scale, scale)
+            pix = page.get_pixmap(matrix=matrix, alpha=False)
+            img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+            doc.close()
+            return img
+        except Exception:
+            pass
+
+    try:
+        poppler_path = find_poppler_path()
+        images = convert_from_bytes(
+            file_bytes,
+            dpi=dpi,
+            userpw=password,
+            poppler_path=poppler_path,
+            first_page=page_index + 1,
+            last_page=page_index + 1,
+        )
+        if images:
+            return images[0]
+    except Exception:
+        pass
+    return None
+
+
 def extract_uco_info_from_bytes(file_bytes: bytes, password: str | None = None) -> str:
-    images = _cb_pdf_images(file_bytes, password, first_page=1, last_page=1)
-    if not images:
+    img = render_pdf_page_as_image(file_bytes, 0, password)
+    if not img:
         raise OcrSetupError("Could not render the first page of the PDF.")
     try:
-        return pytesseract.image_to_string(images[0])
+        return pytesseract.image_to_string(img)
     except (pytesseract.TesseractNotFoundError, pytesseract.TesseractError) as exc:
         raise OcrSetupError(get_tesseract_help_message()) from exc
 
@@ -495,17 +550,20 @@ def extract_uco_transactions(file_bytes: bytes, password: str | None = None) -> 
     
     if is_scanned:
         # Image-based OCR flow
-        images = _cb_pdf_images(file_bytes, password)
-        if not images:
-            raise OcrSetupError("Could not render PDF pages.")
+        page_count = get_pdf_page_count(file_bytes, password)
+        if page_count == 0:
+            return []
             
-        show_progress = st.runtime.exists() and len(images) > 0
+        show_progress = st.runtime.exists() and page_count > 0
         if show_progress:
-            progress_bar = st.progress(0, text=f"Processing Page 1 of {len(images)} (UCO OCR)...")
+            progress_bar = st.progress(0, text=f"Processing Page 1 of {page_count} (UCO OCR)...")
             
         completed = 0
         
-        def process_page_uco_ocr(page_idx, img):
+        def process_page_uco_ocr_index(page_idx):
+            img = render_pdf_page_as_image(file_bytes, page_idx, password)
+            if img is None:
+                return []
             w_dim, h_dim = _uco_get_page_dimensions(file_bytes, page_idx, password)
             words = extract_uco_words_ocr(img, w_dim, h_dim)
             lines = group_words_to_lines(words)
@@ -535,15 +593,15 @@ def extract_uco_transactions(file_bytes: bytes, password: str | None = None) -> 
 
         from concurrent.futures import ThreadPoolExecutor, as_completed
         
-        results = [None] * len(images)
-        with ThreadPoolExecutor() as pool:
-            futures = {pool.submit(process_page_uco_ocr, idx, img): idx for idx, img in enumerate(images)}
+        results = [None] * page_count
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            futures = {pool.submit(process_page_uco_ocr_index, idx): idx for idx in range(page_count)}
             for future in as_completed(futures):
                 idx = futures[future]
                 results[idx] = future.result()
                 completed += 1
                 if show_progress:
-                    progress_bar.progress(completed / len(images), text=f"Processing Page {completed} of {len(images)} (UCO OCR)...")
+                    progress_bar.progress(completed / page_count, text=f"Processing Page {completed} of {page_count} (UCO OCR)...")
                     
             if show_progress:
                 progress_bar.empty()
@@ -777,27 +835,36 @@ def extract_canara_account_info(ocr_text: str) -> dict:
 
 
 def extract_canara_transactions(file_bytes: bytes, password: str | None = None) -> list[dict]:
-    images = _cb_pdf_images(file_bytes, password)
-    
-    show_progress = st.runtime.exists() and len(images) > 0
+    page_count = get_pdf_page_count(file_bytes, password)
+    if page_count == 0:
+        return []
+        
+    show_progress = st.runtime.exists() and page_count > 0
     if show_progress:
-        progress_bar = st.progress(0, text=f"Processing Page 1 of {len(images)} (Canara OCR)...")
+        progress_bar = st.progress(0, text=f"Processing Page 1 of {page_count} (Canara OCR)...")
         
     transactions = []
     completed = 0
     
     from concurrent.futures import ThreadPoolExecutor, as_completed
     
+    def process_page_canara_ocr(page_idx):
+        img = render_pdf_page_as_image(file_bytes, page_idx, password)
+        if img is None:
+            return []
+        return _cb_parse_page(img)
+        
     try:
-        with ThreadPoolExecutor() as pool:
-            futures = {pool.submit(_cb_parse_page, img): idx for idx, img in enumerate(images)}
-            results = [None] * len(images)
+        # Limit max_workers=2 to prevent hitting Streamlit Cloud memory limits
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            futures = {pool.submit(process_page_canara_ocr, idx): idx for idx in range(page_count)}
+            results = [None] * page_count
             for future in as_completed(futures):
                 idx = futures[future]
                 results[idx] = future.result()
                 completed += 1
                 if show_progress:
-                    progress_bar.progress(completed / len(images), text=f"Processing Page {completed} of {len(images)} (Canara OCR)...")
+                    progress_bar.progress(completed / page_count, text=f"Processing Page {completed} of {page_count} (Canara OCR)...")
             
             if show_progress:
                 progress_bar.empty()
@@ -812,11 +879,11 @@ def extract_canara_transactions(file_bytes: bytes, password: str | None = None) 
 
 
 def extract_canara_info_from_bytes(file_bytes: bytes, password: str | None = None) -> dict:
-    images = _cb_pdf_images(file_bytes, password, first_page=1, last_page=1)
-    if not images:
+    img = render_pdf_page_as_image(file_bytes, 0, password)
+    if not img:
         raise CanaraOcrSetupError("Could not render the first page of the PDF.")
     try:
-        ocr_text = pytesseract.image_to_string(images[0])
+        ocr_text = pytesseract.image_to_string(img)
     except (pytesseract.TesseractNotFoundError, pytesseract.TesseractError) as exc:
         raise CanaraOcrSetupError(get_tesseract_help_message()) from exc
     return extract_canara_account_info(ocr_text)
